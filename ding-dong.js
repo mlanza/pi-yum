@@ -220,11 +220,22 @@ module.exports = function dingDong(pi) {
 
   const delay = Math.max(0, config.idle.pauseMs || 1000);
 
+    const canFireIdle = (ctx) => {
+    if (!ctx) return false;
+    if (!ctx.isIdle()) return false;
+    if (ctx.hasPendingMessages()) return false;
+    return true;
+  };
+
   const scheduleIdle = () => {
-    if (!shouldDing("idle")) return;
+    if (!shouldDing("idle") || !lastCtx) return;
     clearIdleTimer();
     idleTimer = setTimeout(() => {
       idleTimer = null;
+      if (!canFireIdle(lastCtx)) {
+        scheduleIdle();
+        return;
+      }
       ring("idle", lastCtx);
     }, delay);
   };
@@ -245,7 +256,6 @@ module.exports = function dingDong(pi) {
     if (shouldDing("turn_end")) {
       ring("turn_end", ctx);
     }
-    scheduleIdle();
   });
 
   pi.on("agent_end", (_event, ctx) => {
@@ -253,6 +263,7 @@ module.exports = function dingDong(pi) {
     if (shouldDing("agent_end")) {
       ring("agent_end", ctx);
     }
+    scheduleIdle();
   });
 
   pi.on("session_shutdown", () => {
