@@ -3,27 +3,30 @@ let toolsFrozen = false;
 export default function(pi) {
 
   function render(ctx) {
-    if (!ctx.hasUI) return;
-
-    ctx.ui.setStatus(
-      "freeze-tools",
-      toolsFrozen
-        ? "🧠 PLAN"
-        : "⚡ ACT",
-      {
+    if (ctx.hasUI) {
+      const statusText = `${ toolsFrozen ? "🧠 Plan" : "⚡ Act"} ${ctx.ui.theme.fg("dim", !toolsFrozen ? "(F7=Plan)" : "(F8=Act)")}`;
+      ctx.ui.setStatus("freeze-tools", statusText, {
         minimal: true
-      }
-    );
+      });
+    }
   }
 
-  pi.registerShortcut("f8", {
-    description: "Toggle planning mode",
-
-    handler: async (ctx) => {
-      toolsFrozen = !toolsFrozen;
+  pi.registerShortcut("f7", { //if you notice an agent doing something peculiar, this is your emergency kill switch
+    description: "Select Plan Mode",
+    handler: (ctx) => {
+      toolsFrozen = true;
       render(ctx);
     },
   });
+
+  pi.registerShortcut("f8", {
+    description: "Select Act Mode",
+    handler: (ctx) => {
+      toolsFrozen = false;
+      render(ctx);
+    },
+  });
+
 
   pi.on("ready", (ctx) => {
     render(ctx);
@@ -43,23 +46,21 @@ export default function(pi) {
     // Add behavioral guidance directly into context
     event.systemMessages = [
       ...(event.systemMessages || []),
-
       `
-PLANNING MODE ACTIVE.
+Plan Mode.
 
-You cannot currently take actions or use tools.
-
+Tool use is currently disabled.
 Do not attempt tool calls.
 Do not retry tool calls.
-Do not search for alternate tools.
+Do not look for workarounds.
 
 In this mode:
 - discuss ideas
-- formulate plans
+- formulate plans (which may involve tools once enabled)
 - explain approaches
 - prepare conceptual changes only
 
-If execution is required, ask the user to re-enable action mode.
+When it comes time to act, the user will enable tool use.
 `
     ];
   });
@@ -70,14 +71,7 @@ If execution is required, ask the user to re-enable action mode.
 
     return {
       block: true,
-
-      reason: `
-PLANNING MODE ACTIVE.
-
-Tool usage is currently disabled.
-
-Discuss the approach conversationally instead.
-`
+      reason: `In Plan Mode tool use is disabled.  Discuss the approach conversationally instead.`
     };
   });
 }
