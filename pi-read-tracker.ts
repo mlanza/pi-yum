@@ -30,6 +30,8 @@ interface FileReadStats {
   external: boolean;
   /** Whether the path exists on disk */
   verified: boolean;
+  /** Timestamp (ms) of the most recent read */
+  lastRead: number;
 }
 
 interface PersistedState {
@@ -113,6 +115,7 @@ export default function readTracker(pi: ExtensionAPI): void {
           readCount: typeof f.readCount === "number" ? f.readCount : 0,
           external: isExternalPath(resolved.path, cwd),
           verified: Boolean(f.verified) || resolved.verified,
+          lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
         };
         fileMap.set(normalized.path, normalized);
       }
@@ -129,6 +132,8 @@ export default function readTracker(pi: ExtensionAPI): void {
 
     const snapshot = [...files];
     const cwdSnap = cwd;
+    // Sort entries with the most recently read files first so the widget stays focused on fresh context
+    snapshot.sort((a, b) => (b.lastRead ?? 0) - (a.lastRead ?? 0));
 
     ctx.ui.setWidget("read-tracker", (_tui, theme) => {
       let cachedLines: string[] | undefined;
@@ -161,14 +166,29 @@ export default function readTracker(pi: ExtensionAPI): void {
               }
             })();
             const isVerified = f.verified || exists;
+            const parentRelative = normalizeSlashes(relative(cwdSnap, parentAbs));
+            const isDirectChild = parentAbs === cwdSnap;
+            // When the file lives below the cwd, show a relative subpath like "./wip";
+            // external files keep the absolute path so you can tell where they came from.
+            const pathLabel = f.external
+              ? parentAbs
+              : isDirectChild
+                ? ""
+                : `./${parentRelative || "."}`;
             const fileStr = isVerified
               ? theme.fg("accent", theme.bold(filename))
-              : theme.fg("borderMuted", theme.bold(filename));
-            const pathStr = isVerified
-              ? theme.fg("dim", parentAbs)
-              : theme.fg("borderMuted", parentAbs);
+              : theme.fg("muted", theme.bold(filename));
+            const pathStr = pathLabel
+              ? f.external
+                ? theme.fg("dim", pathLabel)
+                : isVerified
+                  ? theme.fg("text", pathLabel)
+                  : theme.fg("border", pathLabel)
+              : "";
 
-            const leftPart = `${gutter}${dimSep}${fileStr}${dimSep}${pathStr}`;
+            const leftPart = pathLabel
+              ? `${gutter}${dimSep}${fileStr}${dimSep}${pathStr}`
+              : `${gutter}${dimSep}${fileStr}`;
 
             const countStr = theme.fg("warning", `📖${f.readCount.toString().padStart(3, " ")}`);
             const gap = Math.max(1, width - visibleWidth(leftPart) - visibleWidth(countStr));
@@ -188,6 +208,7 @@ export default function readTracker(pi: ExtensionAPI): void {
   }
 
   function accumulateRead(absPath: string, external: boolean, verified: boolean): void {
+    const now = Date.now();
     const existing = fileMap.get(absPath);
     if (existing) {
       existing.readCount++;
@@ -195,8 +216,9 @@ export default function readTracker(pi: ExtensionAPI): void {
       if (verified) {
         existing.verified = true;
       }
+      existing.lastRead = now;
     } else {
-      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified });
+      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified, lastRead: now });
     }
   }
 
