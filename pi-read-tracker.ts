@@ -32,11 +32,15 @@ interface FileReadStats {
   verified: boolean;
   /** Timestamp (ms) of the most recent read */
   lastRead: number;
+  /** Whether the read is a conjectural/partial inference */
+  questionable: boolean;
 }
 
 interface PersistedState {
   files: FileReadStats[];
   enabled: boolean;
+  fileLimit?: number;
+  showAll?: boolean;
 }
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
@@ -49,6 +53,8 @@ function isExternalPath(absPath: string, cwd: string): boolean {
 }
 
 const VALID_FILENAME_RX = /^[A-Za-z0-9._-]+$/;
+const READ_COMMANDS = new Set(["cat","grep","less","more","head","tail","sed","awk","sort","wc"]);
+const QUESTIONABLE_READ_COMMANDS = new Set(["rg"]);
 
 type PathTransform = (value: string, cwd: string) => string;
 
@@ -85,6 +91,8 @@ function resolveFileCandidate(candidate: string, cwd: string): { path: string; f
 export default function readTracker(pi: ExtensionAPI): void {
   const fileMap = new Map<string, FileReadStats>();
   let widgetEnabled = true;
+  let fileLimit = 8;
+  let showAll = false;
   let cwd = process.cwd();
   // Capture bash commands for read inference
   const pendingBashCommands = new Map<string, string>();
@@ -93,6 +101,8 @@ export default function readTracker(pi: ExtensionAPI): void {
     pi.appendEntry("read-tracker", {
       files: [...fileMap.values()],
       enabled: widgetEnabled,
+      fileLimit,
+      showAll,
     } satisfies PersistedState);
   }
 
@@ -107,6 +117,8 @@ export default function readTracker(pi: ExtensionAPI): void {
     }
     if (lastState) {
       widgetEnabled = lastState.enabled ?? true;
+      fileLimit = lastState.fileLimit ?? 8;
+      showAll = lastState.showAll ?? false;
       for (const f of lastState.files ?? []) {
         const resolved = resolveFileCandidate(f.path, cwd);
         if (!resolved) continue;
@@ -116,6 +128,7 @@ export default function readTracker(pi: ExtensionAPI): void {
           external: isExternalPath(resolved.path, cwd),
           verified: Boolean(f.verified) || resolved.verified,
           lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
+          questionable: Boolean(f.questionable),
         };
         fileMap.set(normalized.path, normalized);
       }
@@ -130,10 +143,16 @@ export default function readTracker(pi: ExtensionAPI): void {
       return;
     }
 
-    const snapshot = [...files];
+    const sorted = [...files];
     const cwdSnap = cwd;
     // Sort entries with the most recently read files first so the widget stays focused on fresh context
-    snapshot.sort((a, b) => (b.lastRead ?? 0) - (a.lastRead ?? 0));
+    sorted.sort((a, b) => (b.lastRead ?? 0) - (a.lastRead ?? 0));
+
+    const totalCount = sorted.length;
+    const limitCap = Math.max(1, fileLimit);
+    const displayCount = showAll ? totalCount : Math.min(limitCap, totalCount);
+    const hiddenCount = totalCount - displayCount;
+    const visibleFiles = sorted.slice(0, displayCount);
 
     ctx.ui.setWidget("read-tracker", (_tui, theme) => {
       let cachedLines: string[] | undefined;
@@ -145,7 +164,9 @@ export default function readTracker(pi: ExtensionAPI): void {
           const lines: string[] = [];
 
           // Header
-          const title = ` Read files (${snapshot.length}) `;
+          const title = hiddenCount === 0
+            ? ` Read files (${totalCount}) `
+            : ` Read files (${displayCount}/${totalCount}) `;
           const titleColored = theme.fg("accent", title);
           const borderLen = Math.max(0, width - visibleWidth(title));
           const borderLeft = theme.fg("borderMuted", "─".repeat(2));
@@ -153,11 +174,14 @@ export default function readTracker(pi: ExtensionAPI): void {
           lines.push(truncateToWidth(`${borderLeft}${titleColored}${borderRight}`, width));
 
           // File rows
-          for (const f of snapshot) {
+          for (const f of visibleFiles) {
             const filename = basename(f.path);
             const parentAbs = dirname(f.path);
             const dimSep = theme.fg("dim", " | ");
-            const gutter = f.external ? "⚠️ " : "   ";
+            const gutterParts: string[] = [];
+            if (f.questionable) gutterParts.push("❓");
+            if (f.external) gutterParts.push("⚠️");
+            const gutter = gutterParts.length ? `${gutterParts.join("")} ` : "   ";
             const exists = (() => {
               try {
                 return existsSync(f.path);
@@ -195,6 +219,11 @@ export default function readTracker(pi: ExtensionAPI): void {
             lines.push(truncateToWidth(`${leftPart}${" ".repeat(gap)}${countStr}`, width));
           }
 
+          if (hiddenCount > 0) {
+            const moreMsg = ` … ${hiddenCount} older file${hiddenCount !== 1 ? "s" : ""} hidden · /read-tracker all`;
+            lines.push(truncateToWidth(theme.fg("dim", moreMsg), width));
+          }
+
           cachedLines = lines;
           cachedWidth = width;
           return lines;
@@ -207,26 +236,27 @@ export default function readTracker(pi: ExtensionAPI): void {
     });
   }
 
-  function accumulateRead(absPath: string, external: boolean, verified: boolean): void {
+  function accumulateRead(absPath: string, external: boolean, verified: boolean, questionable = false): void {
     const now = Date.now();
     const existing = fileMap.get(absPath);
     if (existing) {
       existing.readCount++;
       existing.external = existing.external || external;
+      existing.questionable = existing.questionable || questionable;
       if (verified) {
         existing.verified = true;
       }
       existing.lastRead = now;
     } else {
-      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified, lastRead: now });
+      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified, lastRead: now, questionable });
     }
   }
 
-  function trackReadCandidate(candidate: string): boolean {
+  function trackReadCandidate(candidate: string, questionable = false): boolean {
     const resolved = resolveFileCandidate(candidate, cwd);
     if (!resolved) return false;
     const external = isExternalPath(resolved.path, cwd);
-    accumulateRead(resolved.path, external, resolved.verified);
+    accumulateRead(resolved.path, external, resolved.verified, questionable);
     return true;
   }
 
@@ -269,24 +299,21 @@ export default function readTracker(pi: ExtensionAPI): void {
       const cmd = pendingBashCommands.get(event.toolCallId) || "";
       pendingBashCommands.delete(event.toolCallId);
       const parts = cmd.split("|").map(s => s.trim());
-      const readCmds = new Set(["cat","grep","less","more","head","tail","sed","awk","sort","wc"]);
       let tracked = false;
       for (const part of parts) {
         const [bin, ...args] = part.split(/\s+/);
         const base = bin.includes("/") ? bin.slice(bin.lastIndexOf("/") + 1) : bin;
-        if (readCmds.has(base)) {
-          for (const arg of args) {
-            if (!arg.startsWith("-") && !arg.includes("=")) {
-              const p = arg.replace(/^['"]|['"]$/g, "");
-              if (trackReadCandidate(p)) {
-                tracked = true;
-              }
+        const shouldTrack = READ_COMMANDS.has(base) || QUESTIONABLE_READ_COMMANDS.has(base);
+        if (!shouldTrack) continue;
+        const isQuestionable = QUESTIONABLE_READ_COMMANDS.has(base);
+        for (const arg of args) {
+          if (!arg.startsWith("-") && !arg.includes("=")) {
+            const p = arg.replace(/^['"]|['"]$/g, "");
+            if (trackReadCandidate(p, isQuestionable)) {
+              tracked = true;
             }
           }
         }
-      }
-      if (pendingBashCommands.has(event.toolCallId)) {
-        pendingBashCommands.delete(event.toolCallId);
       }
       if (tracked) {
         persistState();
@@ -299,7 +326,7 @@ export default function readTracker(pi: ExtensionAPI): void {
   // ── Commands ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("read-tracker", {
-    description: "Toggle read-files widget  |  args: clear",
+    description: "Toggle read-files widget  |  args: clear | all | limit <N>",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
       if (arg === "clear") {
@@ -307,6 +334,31 @@ export default function readTracker(pi: ExtensionAPI): void {
         persistState();
         updateWidget(ctx);
         ctx.ui.notify("Read tracker: cleared", "info");
+        return;
+      }
+      if (arg === "all") {
+        showAll = !showAll;
+        persistState();
+        updateWidget(ctx);
+        ctx.ui.notify(
+          showAll
+            ? "Read tracker: showing all files"
+            : `Read tracker: showing last ${fileLimit} files`,
+          "info",
+        );
+        return;
+      }
+      if (arg.startsWith("limit ")) {
+        const n = parseInt(arg.slice(6), 10);
+        if (!isNaN(n) && n > 0) {
+          fileLimit = n;
+          showAll = false;
+          persistState();
+          updateWidget(ctx);
+          ctx.ui.notify(`Read tracker: limit set to ${n}`, "info");
+        } else {
+          ctx.ui.notify("Usage: /read-tracker limit <number>", "warning");
+        }
         return;
       }
       widgetEnabled = !widgetEnabled;
