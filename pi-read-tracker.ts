@@ -15,7 +15,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { existsSync } from "node:fs";
+
 
 // ─── Data model ─────────────────────────────────────────────────────────────
 
@@ -24,6 +26,10 @@ interface FileReadStats {
   path: string;
   /** How many times this file has been read */
   readCount: number;
+  /** Whether the file lives outside the current session cwd */
+  external: boolean;
+  /** Whether the path exists on disk */
+  verified: boolean;
 }
 
 interface PersistedState {
@@ -33,13 +39,43 @@ interface PersistedState {
 
 // ─── Path helpers ────────────────────────────────────────────────────────────
 
-function toRelativePath(absPath: string, cwd: string): string {
-  const prefix = cwd.endsWith("/") ? cwd : `${cwd}/`;
-  return absPath.startsWith(prefix) ? absPath.slice(prefix.length) : absPath;
+function isExternalPath(absPath: string, cwd: string): boolean {
+  const rel = relative(cwd, absPath);
+  if (!rel) return false;
+  const first = rel.split(/[\\/]/)[0];
+  return first === "..";
 }
 
-function toAbsPath(filePath: string, cwd: string): string {
-  return isAbsolute(filePath) ? filePath : resolve(cwd, filePath);
+const VALID_FILENAME_RX = /^[A-Za-z0-9._-]+$/;
+
+type PathTransform = (value: string, cwd: string) => string;
+
+const normalizeSlashes: PathTransform = (value, _cwd) => value.replace(/[\\/]+/g, "/");
+const ensureAbsolutePath: PathTransform = (value, cwd) => isAbsolute(value) ? value : resolve(cwd, value);
+
+function composePathTransforms(...steps: PathTransform[]): PathTransform {
+  return (value, cwd) => steps.reduce((result, step) => step(result, cwd), value);
+}
+
+const toCanonicalAbsPath = composePathTransforms(
+  normalizeSlashes,
+  ensureAbsolutePath,
+  normalizeSlashes,
+);
+
+function resolveFileCandidate(candidate: string, cwd: string): { path: string; filename: string; verified: boolean } | undefined {
+  const trimmed = candidate.trim();
+  if (!trimmed) return undefined;
+  const absolute = toCanonicalAbsPath(trimmed, cwd);
+  const filename = basename(absolute);
+  if (!VALID_FILENAME_RX.test(filename)) return undefined;
+  let verified = false;
+  try {
+    verified = existsSync(absolute);
+  } catch {
+    verified = false;
+  }
+  return { path: absolute, filename, verified };
 }
 
 // ─── Extension entry point ───────────────────────────────────────────────────
@@ -70,7 +106,15 @@ export default function readTracker(pi: ExtensionAPI): void {
     if (lastState) {
       widgetEnabled = lastState.enabled ?? true;
       for (const f of lastState.files ?? []) {
-        fileMap.set(f.path, f);
+        const resolved = resolveFileCandidate(f.path, cwd);
+        if (!resolved) continue;
+        const normalized: FileReadStats = {
+          path: resolved.path,
+          readCount: typeof f.readCount === "number" ? f.readCount : 0,
+          external: isExternalPath(resolved.path, cwd),
+          verified: Boolean(f.verified) || resolved.verified,
+        };
+        fileMap.set(normalized.path, normalized);
       }
     }
   }
@@ -105,19 +149,28 @@ export default function readTracker(pi: ExtensionAPI): void {
 
           // File rows
           for (const f of snapshot) {
-            const rel = toRelativePath(f.path, cwdSnap);
-            const filename = basename(rel);
-            const parent = dirname(rel);
+            const filename = basename(f.path);
+            const parentAbs = dirname(f.path);
             const dimSep = theme.fg("dim", " | ");
-            const icon = "   ";
-            const fileStr = theme.fg("accent", theme.bold(filename));
-            const parentStr = theme.fg("dim", parent);
+            const gutter = f.external ? "⚠️ " : "   ";
+            const exists = (() => {
+              try {
+                return existsSync(f.path);
+              } catch {
+                return false;
+              }
+            })();
+            const isVerified = f.verified || exists;
+            const fileStr = isVerified
+              ? theme.fg("accent", theme.bold(filename))
+              : theme.fg("borderMuted", theme.bold(filename));
+            const pathStr = isVerified
+              ? theme.fg("dim", parentAbs)
+              : theme.fg("borderMuted", parentAbs);
 
-            const leftPart = parent === "."
-              ? `${icon}${dimSep}${fileStr}`
-              : `${icon}${dimSep}${fileStr}${dimSep}${parentStr}`;
+            const leftPart = `${gutter}${dimSep}${fileStr}${dimSep}${pathStr}`;
 
-            const countStr = theme.fg("warning", `📖${f.readCount}`);
+            const countStr = theme.fg("warning", `📖${f.readCount.toString().padStart(3, " ")}`);
             const gap = Math.max(1, width - visibleWidth(leftPart) - visibleWidth(countStr));
             lines.push(truncateToWidth(`${leftPart}${" ".repeat(gap)}${countStr}`, width));
           }
@@ -134,13 +187,25 @@ export default function readTracker(pi: ExtensionAPI): void {
     });
   }
 
-  function accumulateRead(absPath: string): void {
+  function accumulateRead(absPath: string, external: boolean, verified: boolean): void {
     const existing = fileMap.get(absPath);
     if (existing) {
       existing.readCount++;
+      existing.external = existing.external || external;
+      if (verified) {
+        existing.verified = true;
+      }
     } else {
-      fileMap.set(absPath, { path: absPath, readCount: 1 });
+      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified });
     }
+  }
+
+  function trackReadCandidate(candidate: string): boolean {
+    const resolved = resolveFileCandidate(candidate, cwd);
+    if (!resolved) return false;
+    const external = isExternalPath(resolved.path, cwd);
+    accumulateRead(resolved.path, external, resolved.verified);
+    return true;
   }
 
   // ── Events ───────────────────────────────────────────────────────────────
@@ -170,10 +235,10 @@ export default function readTracker(pi: ExtensionAPI): void {
     // explicit read-tool calls
     if (event.toolName === "read") {
       const input = event.input as { path: string };
-      const abs = toAbsPath(input.path, cwd);
-      accumulateRead(abs);
-      persistState();
-      updateWidget(ctx);
+      if (trackReadCandidate(input.path)) {
+        persistState();
+        updateWidget(ctx);
+      }
       return;
     }
 
@@ -183,6 +248,7 @@ export default function readTracker(pi: ExtensionAPI): void {
       pendingBashCommands.delete(event.toolCallId);
       const parts = cmd.split("|").map(s => s.trim());
       const readCmds = new Set(["cat","grep","less","more","head","tail","sed","awk","sort","wc"]);
+      let tracked = false;
       for (const part of parts) {
         const [bin, ...args] = part.split(/\s+/);
         const base = bin.includes("/") ? bin.slice(bin.lastIndexOf("/") + 1) : bin;
@@ -190,11 +256,8 @@ export default function readTracker(pi: ExtensionAPI): void {
           for (const arg of args) {
             if (!arg.startsWith("-") && !arg.includes("=")) {
               const p = arg.replace(/^['"]|['"]$/g, "");
-              try {
-                const abs = toAbsPath(p, cwd);
-                accumulateRead(abs);
-              } catch {
-                /* ignore invalid paths */
+              if (trackReadCandidate(p)) {
+                tracked = true;
               }
             }
           }
@@ -203,8 +266,10 @@ export default function readTracker(pi: ExtensionAPI): void {
       if (pendingBashCommands.has(event.toolCallId)) {
         pendingBashCommands.delete(event.toolCallId);
       }
-      persistState();
-      updateWidget(ctx);
+      if (tracked) {
+        persistState();
+        updateWidget(ctx);
+      }
       return;
     }
   });
