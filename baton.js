@@ -1,92 +1,36 @@
 const COMMAND_NAME = "baton";
-const USAGE = [
-  "Usage:",
-  "  /baton make [extra instructions]",
-  "  /baton pass [extra instructions]         # seed context but do not resume",
-  "  /baton pass! [extra instructions]        # seed context and immediately resume",
-].join("\n");
 
-const MAKE_PROMPT = (extra) => `Create a concise handoff brief for continuing this work in a fresh session.
-
-Include:
-- current goal
-- current stage
-- decisions made
-- completed work
-- remaining work
-- useful files, commands, links, or deliverables
-- validation already performed
-- known risks or open questions
-- recommended next action
-
-Additional user instructions:
-${extra}
-
-Write the brief so another session can resume without rediscovering completed work.`;
 
 const PASS_PROMPT = (brief, extra) => {
-  const base = `We are resuming where we left off, from this approved baton brief:
+  const base = `The following brief explains where things left off:
+
+# Brief
 
 ${brief}
 
-Read the brief, identify the current stage and next unfinished action, then continue from there without rediscovering completed work. Do not repeat completed work unless validation requires it. If the brief is incomplete, state the missing information briefly and proceed with the safest next step.`;
+Read the brief, then continue from there.`;
   if (!extra) {
     return base;
   }
   return `${base}
 
-Additional user instructions for the new session:
+Additional instructions for the new session:
 ${extra}`;
 };
 
 export default function (pi) {
   pi.registerCommand(COMMAND_NAME, {
-    description: "Create or pass a baton brief to resume work in a fresh session",
+    description: "Pass the brief to resume work in a fresh session",
     handler: async (args, ctx) => {
-      const input = (args ?? "").trim();
-      if (!input) {
-        return notifyUsage(ctx);
-      }
-
-      const firstSpace = input.indexOf(" ");
-      const subcommand = firstSpace === -1 ? input : input.slice(0, firstSpace);
-      const extra = firstSpace === -1 ? "" : input.slice(firstSpace + 1).trim();
-      let verb = subcommand.toLowerCase();
-      let immediate = false;
-      if (verb === "pass!") {
-        immediate = true;
-        verb = "pass";
-      }
-
-      if (verb === "make") {
-        await requestBatonBrief(extra, ctx);
-        return;
-      }
-
-      if (verb === "pass") {
-        await passBaton(extra, ctx, immediate);
-        return;
-      }
-
-      notifyUsage(ctx);
+      const extra = (args ?? "").trim();
+      await passBaton(extra, ctx);
     },
   });
 
-  function notifyUsage(ctx) {
-    safeNotify(ctx, USAGE, "warning");
-  }
-
-  async function requestBatonBrief(extra, ctx) {
-    const instructions = extra.trim() || "None.";
-    const prompt = MAKE_PROMPT(instructions);
-    safeNotify(ctx, "Queuing baton brief request...", "info");
-    await pi.sendUserMessage(prompt);
-  }
-
-  async function passBaton(extra, ctx, immediate = false) {
+  async function passBaton(extra, ctx) {
     await ctx.waitForIdle();
     const branch = ctx.sessionManager.getBranch();
-    const lastAssistantEntry = branch.find((entry) => entry?.type === "message" && entry.message?.role === "assistant");
+    const lastAssistantEntry = branch.slice().reverse().find((entry) => entry?.type === "message" && entry.message?.role === "assistant");
 
     if (!lastAssistantEntry) {
       safeNotify(ctx, "No assistant response available to pass as a baton.", "error");
@@ -102,22 +46,14 @@ export default function (pi) {
     const continuationPrompt = PASS_PROMPT(brief, extra);
 
     try {
-      if (immediate) {
-        const result = await ctx.newSession({
-          parentSession: ctx.sessionManager.getSessionFile(),
-          withSession: async (newCtx) => {
-            // Seed and immediately resume the new session
+      const result = await ctx.newSession({
+        parentSession: ctx.sessionManager.getSessionFile(),
+        withSession: async (newCtx) => {
+          if (extra) {
+            // Immediately resume the new session with the baton brief and extra instructions
             safeNotify(newCtx, "Baton passed; a new session is now continuing with the approved brief.", "info");
             await newCtx.sendUserMessage(continuationPrompt);
-          },
-        });
-        if (result.cancelled) {
-          throw new Error("session_creation_cancelled");
-        }
-      } else {
-        const result = await ctx.newSession({
-          parentSession: ctx.sessionManager.getSessionFile(),
-          withSession: async (newCtx) => {
+          } else {
             // Seed the new session with the baton brief without triggering the agent
             await newCtx.sendMessage(
               {
@@ -128,11 +64,11 @@ export default function (pi) {
               { triggerTurn: false }
             );
             safeNotify(newCtx, "Baton passed; a new session created with approved brief and awaiting your instruction.", "info");
-          },
-        });
-        if (result.cancelled) {
-          throw new Error("session_creation_cancelled");
-        }
+          }
+        },
+      });
+      if (result.cancelled) {
+        throw new Error("session_creation_cancelled");
       }
     } catch (error) {
       await shareManualContinuation(continuationPrompt, ctx);
@@ -150,26 +86,14 @@ export default function (pi) {
         ? [{ type: "text", text: message.content }]
         : [];
 
+    // Only keep actual text blocks; drop thinking/toolCall/image blocks
     const text = blocks
-      .map((block) => {
-        if (!block) return "";
-        switch (block.type) {
-          case "text":
-            return block.text;
-          case "thinking":
-            return `[thinking: ${block.thinking}]`;
-          case "toolCall":
-            return `[tool call ${block.name}: ${JSON.stringify(block.arguments ?? {})}]`;
-          case "image":
-            return `[image ${block.mimeType ?? "unknown"}]`;
-          default:
-            return `[${block.type}]`;
-        }
-      })
-      .filter(Boolean)
-      .join("\n");
+      .filter((block) => block?.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
 
-    return text.trim();
+    return text;
   }
 
   async function shareManualContinuation(prompt, ctx) {
