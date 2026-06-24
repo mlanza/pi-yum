@@ -2,7 +2,8 @@ const COMMAND_NAME = "baton";
 const USAGE = [
   "Usage:",
   "  /baton make [extra instructions]",
-  "  /baton pass [extra instructions]",
+  "  /baton pass [extra instructions]         # seed context but do not resume",
+  "  /baton pass! [extra instructions]        # seed context and immediately resume",
 ].join("\n");
 
 const MAKE_PROMPT = (extra) => `Create a concise handoff brief for continuing this work in a fresh session.
@@ -50,7 +51,12 @@ export default function (pi) {
       const firstSpace = input.indexOf(" ");
       const subcommand = firstSpace === -1 ? input : input.slice(0, firstSpace);
       const extra = firstSpace === -1 ? "" : input.slice(firstSpace + 1).trim();
-      const verb = subcommand.toLowerCase();
+      let verb = subcommand.toLowerCase();
+      let immediate = false;
+      if (verb === "pass!") {
+        immediate = true;
+        verb = "pass";
+      }
 
       if (verb === "make") {
         await requestBatonBrief(extra, ctx);
@@ -58,7 +64,7 @@ export default function (pi) {
       }
 
       if (verb === "pass") {
-        await passBaton(extra, ctx);
+        await passBaton(extra, ctx, immediate);
         return;
       }
 
@@ -77,7 +83,7 @@ export default function (pi) {
     await pi.sendUserMessage(prompt);
   }
 
-  async function passBaton(extra, ctx) {
+  async function passBaton(extra, ctx, immediate = false) {
     await ctx.waitForIdle();
     const branch = ctx.sessionManager.getBranch();
     const lastAssistantEntry = branch.find((entry) => entry?.type === "message" && entry.message?.role === "assistant");
@@ -96,18 +102,38 @@ export default function (pi) {
     const continuationPrompt = PASS_PROMPT(brief, extra);
 
     try {
-      const result = await ctx.newSession({
-        parentSession: ctx.sessionManager.getSessionFile(),
-        withSession: async (newCtx) => {
-          await newCtx.sendUserMessage(continuationPrompt);
-        },
-      });
-
-      if (result.cancelled) {
-        throw new Error("session_creation_cancelled");
+      if (immediate) {
+        const result = await ctx.newSession({
+          parentSession: ctx.sessionManager.getSessionFile(),
+          withSession: async (newCtx) => {
+            // Seed and immediately resume the new session
+            safeNotify(newCtx, "Baton passed; a new session is now continuing with the approved brief.", "info");
+            await newCtx.sendUserMessage(continuationPrompt);
+          },
+        });
+        if (result.cancelled) {
+          throw new Error("session_creation_cancelled");
+        }
+      } else {
+        const result = await ctx.newSession({
+          parentSession: ctx.sessionManager.getSessionFile(),
+          withSession: async (newCtx) => {
+            // Seed the new session with the baton brief without triggering the agent
+            await newCtx.sendMessage(
+              {
+                customType: "baton.manual",
+                content: continuationPrompt,
+                display: true,
+              },
+              { triggerTurn: false }
+            );
+            safeNotify(newCtx, "Baton passed; a new session created with approved brief and awaiting your instruction.", "info");
+          },
+        });
+        if (result.cancelled) {
+          throw new Error("session_creation_cancelled");
+        }
       }
-
-      safeNotify(ctx, "Baton passed; a new session is now continuing with the approved brief.", "info");
     } catch (error) {
       await shareManualContinuation(continuationPrompt, ctx);
     }
