@@ -25,12 +25,33 @@ interface NetworkReadStats {
   url: string;
   /** Domain + scheme (https://example.com) */
   domain: string;
+  /** Host portion (example.com) */
+  host: string;
   /** Path/query/hash portion (e.g., /docs/reference#api) */
   path: string;
   /** How many times this resource has been read */
   readCount: number;
   /** Timestamp (ms) of the most recent read */
   lastRead: number;
+  /** Whether we consider this source trusted */
+  trusted: boolean;
+}
+
+const TRUSTED_HOST_PATTERNS = [
+  "pi.dev",
+  "github.com",
+  "raw.githubusercontent.com",
+  "cdn.jsdelivr.net",
+  "jina.ai",
+  "r.jina.ai",
+  "boardgamegeek.com",
+  "example.com",
+];
+
+function isTrustedHost(host: string): boolean {
+  if (!host) return false;
+  const normalized = host.toLowerCase();
+  return TRUSTED_HOST_PATTERNS.some(pattern => normalized === pattern || normalized.endsWith(`.${pattern}`));
 }
 
 interface PersistedState {
@@ -42,7 +63,7 @@ interface PersistedState {
 
 const DEFAULT_LIMIT = 8;
 
-function resolveNetworkResource(candidate: string): { url: string; domain: string; path: string } | undefined {
+function resolveNetworkResource(candidate: string): { url: string; domain: string; host: string; path: string; trusted: boolean } | undefined {
   const trimmed = candidate.trim();
   if (!trimmed) return undefined;
   let parsed: URL;
@@ -55,11 +76,18 @@ function resolveNetworkResource(candidate: string): { url: string; domain: strin
     return undefined;
   }
   const domain = `${parsed.protocol}//${parsed.host}`;
+  const host = parsed.host;
   const pathname = parsed.pathname || "/";
   const query = parsed.search || "";
   const hash = parsed.hash || "";
   const path = `${pathname}${query}${hash}`;
-  return { url: parsed.toString(), domain, path: path === "" ? "/" : path };
+  return {
+    url: parsed.toString(),
+    domain,
+    host,
+    path: path === "" ? "/" : path,
+    trusted: isTrustedHost(host),
+  };
 }
 
 // ─── Extension entry point ───────────────────────────────────────────────────
@@ -94,7 +122,26 @@ export default function webTracker(pi: ExtensionAPI): void {
     fileLimit = lastState.fileLimit ?? DEFAULT_LIMIT;
     showAll = lastState.showAll ?? false;
     for (const resource of lastState.resources ?? []) {
-      resourceMap.set(resource.url, resource);
+      const url = resource.url;
+      if (!url) continue;
+      let parsed: URL | undefined;
+      try {
+        parsed = new URL(url);
+      } catch {
+        parsed = undefined;
+      }
+      const host = resource.host || parsed?.host || "";
+      const domain = resource.domain || (parsed ? parsed.origin : "");
+      const normalized: NetworkReadStats = {
+        url,
+        domain,
+        host,
+        path: resource.path ?? "/",
+        readCount: typeof resource.readCount === "number" ? resource.readCount : 0,
+        lastRead: typeof resource.lastRead === "number" ? resource.lastRead : 0,
+        trusted: typeof resource.trusted === "boolean" ? resource.trusted : isTrustedHost(host),
+      };
+      resourceMap.set(url, normalized);
     }
   }
 
@@ -136,8 +183,11 @@ export default function webTracker(pi: ExtensionAPI): void {
           const dimSep = theme.fg("dim", " | ");
           for (const resource of visibleResources) {
             const pathLabel = resource.path || "/";
-            const leftPart = `${"🌐 "}${dimSep}${theme.fg("accent", theme.bold(pathLabel))}`;
-            const domainStr = theme.fg("dim", resource.domain);
+            const trustBadge = resource.trusted ? "" : `${theme.fg("error", "⚠️ ")}`;
+            const leftPart = `${trustBadge}🌐 ${dimSep}${theme.fg("accent", theme.bold(pathLabel))}`;
+            const domainStr = resource.trusted
+              ? theme.fg("dim", resource.domain)
+              : theme.fg("warning", resource.domain);
             const leftWithDomain = `${leftPart}${dimSep}${domainStr}`;
             const countStr = theme.fg("warning", `📖${resource.readCount.toString().padStart(3, " ")}`);
             const gap = Math.max(1, width - visibleWidth(leftWithDomain) - visibleWidth(countStr));
@@ -161,19 +211,24 @@ export default function webTracker(pi: ExtensionAPI): void {
     });
   }
 
-  function accumulate(resource: { url: string; domain: string; path: string }): void {
+  function accumulate(resource: { url: string; domain: string; host: string; path: string; trusted: boolean }): void {
     const now = Date.now();
     const existing = resourceMap.get(resource.url);
     if (existing) {
       existing.readCount++;
       existing.lastRead = now;
+      existing.domain = resource.domain;
+      existing.host = resource.host;
+      existing.trusted = existing.trusted && resource.trusted;
     } else {
       resourceMap.set(resource.url, {
         url: resource.url,
         domain: resource.domain,
+        host: resource.host,
         path: resource.path || "/",
         readCount: 1,
         lastRead: now,
+        trusted: resource.trusted,
       });
     }
   }

@@ -24,7 +24,7 @@ Reload Pi with `/reload` if it is already running.
 ## Behavior
 
 - Tracks `read("https://…")` calls and every successful [`webfetch`](https://pi.dev/docs/tools/webfetch) invocation. The service URL plus any post-redirect final URL are normalized to a canonical form before counting.
-- The widget renders as `🌐 | <path> | <domain>` (path is everything after the domain) and sorts entries with the most recently read resources at the top. A right-aligned `📖nnn` counter keeps the numbers tidy.
+- The widget renders as `🌐 | <path> | <domain>` (path is everything after the domain) and sorts entries with the most recently read resources at the top. A right-aligned `📖nnn` counter keeps the numbers tidy. Domains outside the built-in trusted list (pi.dev, GitHub, CDNs, etc.) add a ⚠️ badge and a warning-toned domain so you can pause before trusting new content.
 - When more than eight resources are tracked the header switches from `Read resources (N)` to `Read resources (visible/total)` and a dim footer hints at `/web-tracker all`. Use `/web-tracker limit <N>` to raise the cap and reset the footer.
 - Historical reads survive restarts because the `fileLimit`, `showAll`, and resource list persist via `pi.appendEntry`.
 
@@ -32,4 +32,4 @@ Reload Pi with `/reload` if it is already running.
 
 - A lightweight `pendingWebfetchUrls` map grabs the requested URL at `tool_call` time so the ensuing `tool_result` handler can attribute the read even if a redirect happened.
 - Canonical URLs are resolved once and stored with domain/path metadata so the widget can display the domain separately from the resource path.
-- The UI mirrors the read-files tracker (header/footer, limit controls, right-aligned counters) so switching between the widgets feels consistent.
+- The UI mirrors the read-files tracker (header/footer, limit controls, right-aligned counters) so switching between the widgets feels consistent. When you see ⚠️ it signals that the read came from a domain that is not on the tracker’s trusted list, so you may want to double-check any edits that depend on that data.
