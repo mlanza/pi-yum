@@ -1,127 +1,375 @@
-const COMMAND_NAME = "baton";
+/**
+ * baton.js — pi extension: restart a session with context carried forward.
+ *
+ * Both /baton (slash command) and baton() (LLM tool) seed a fresh session
+ * with the last assistant response, then optionally dispatch the agent
+ * with an addendum.
+ *
+ * Usage:
+ *   /baton                     → new session with last response, waits for input
+ *   /baton now summarize       → new session + auto-trigger with addendum
+ *   tools.baton()              → same as /baton
+ *   tools.baton("Continue…")   → same as /baton <addendum>
+ *
+ * Based on PRD: leap-prd.md (s/baton/leap)
+ * Document version: 1.0.0
+ */
 
+import { appendFile, mkdir } from "node:fs/promises";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 
-const PASS_PROMPT = (brief, extra) => {
-  const base = `The following brief explains where things left off:
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-# Brief
+const MAX_ADDENDUM_LENGTH = 500;
 
-${brief}
+// ---------------------------------------------------------------------------
+// Debug logging
+// ---------------------------------------------------------------------------
 
-Read the brief, then continue from there.`;
-  if (!extra) {
-    return base;
+/** @type {string | null} */
+let debugLogPath = null;
+
+/**
+ * Lazy-init a JSONL debug log adjacent to this extension file.
+ * Records each baton invocation with context for post-hoc analysis.
+ *
+ * @param {string} method - "command", "tool", or "batondebug"
+ * @param {{ addendum?: string; branchLength?: number; durationMs?: number; ok?: boolean; error?: string; data?: unknown }} info
+ */
+async function debugLog(method, info) {
+  try {
+    if (!debugLogPath) {
+      const __filename = fileURLToPath(import.meta.url);
+      debugLogPath = join(dirname(__filename), "baton-debug.jsonl");
+      // Ensure the directory exists
+      await mkdir(dirname(debugLogPath), { recursive: true });
+    }
+
+    const entry = {
+      t: new Date().toISOString(),
+      m: method,
+      a: (info.addendum ?? "").length > 0,
+      al: (info.addendum ?? "").length,
+      bl: info.branchLength ?? 0,
+      d: info.durationMs ?? 0,
+      ok: info.ok ?? true,
+      e: info.error ?? null,
+      // Arbitrary structured data passed via batondebug tool
+      ...(info.data !== undefined && info.data !== null
+        ? { data: info.data }
+        : {}),
+    };
+
+    await appendFile(debugLogPath, JSON.stringify(entry) + "\n", "utf8");
+  } catch {
+    // Debug logging is best-effort; never crash the command.
   }
-  return `${base}
+}
 
-Additional instructions for the new session:
-${extra}`;
-};
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-export default function (pi) {
-  pi.registerCommand(COMMAND_NAME, {
-    description: "Pass the brief to resume work in a fresh session",
-    handler: async (args, ctx) => {
-      const extra = (args ?? "").trim();
-      await passBaton(extra, ctx);
-    },
-  });
-
-  async function passBaton(extra, ctx) {
-    await ctx.waitForIdle();
-    const branch = ctx.sessionManager.getBranch();
-    const lastAssistantEntry = branch.slice().reverse().find((entry) => entry?.type === "message" && entry.message?.role === "assistant");
-
-    if (!lastAssistantEntry) {
-      safeNotify(ctx, "No assistant response available to pass as a baton.", "error");
-      return;
-    }
-
-    const brief = assistantMessageToText(lastAssistantEntry.message);
-    if (!brief) {
-      safeNotify(ctx, "The last assistant response was empty; cannot pass the baton.", "error");
-      return;
-    }
-
-    const continuationPrompt = PASS_PROMPT(brief, extra);
-
-    try {
-      const result = await ctx.newSession({
-        parentSession: ctx.sessionManager.getSessionFile(),
-        withSession: async (newCtx) => {
-          if (extra) {
-            // Immediately resume the new session with the baton brief and extra instructions
-            safeNotify(newCtx, "Baton passed; a new session is now continuing with the approved brief.", "info");
-            await newCtx.sendUserMessage(continuationPrompt);
-          } else {
-            // Seed the new session with the baton brief without triggering the agent
-            await newCtx.sendMessage(
-              {
-                customType: "baton.manual",
-                content: continuationPrompt,
-                display: true,
-              },
-              { triggerTurn: false }
-            );
-            safeNotify(newCtx, "Baton passed; a new session created with approved brief and awaiting your instruction.", "info");
-          }
-        },
-      });
-      if (result.cancelled) {
-        throw new Error("session_creation_cancelled");
-      }
-    } catch (error) {
-      await shareManualContinuation(continuationPrompt, ctx);
+/**
+ * Walk the branch backwards and return the most recent assistant
+ * (role === "assistant") message, or null if none exists.
+ *
+ * @param {readonly unknown[]} branch
+ * @returns {{ content: unknown; timestamp?: number } | null}
+ */
+function getLastAssistantMessage(branch) {
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (
+      entry &&
+      entry.type === "message" &&
+      entry.message &&
+      entry.message.role === "assistant"
+    ) {
+      return {
+        content: entry.message.content,
+        timestamp: entry.message.timestamp,
+      };
     }
   }
+  return null;
+}
 
-  function assistantMessageToText(message) {
-    if (!message) {
-      return "";
-    }
-
-    const blocks = Array.isArray(message.content)
-      ? message.content
-      : typeof message.content === "string"
-        ? [{ type: "text", text: message.content }]
-        : [];
-
-    // Only keep actual text blocks; drop thinking/toolCall/image blocks
-    const text = blocks
-      .filter((block) => block?.type === "text")
+/**
+ * Extract plain text from an assistant message's content, which may be
+ * a string or an array of content blocks (text, thinking, toolCall, etc.).
+ *
+ * @param {unknown} content
+ * @returns {string}
+ */
+function assistantContentToText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block?.type === "text" && typeof block.text === "string")
       .map((block) => block.text)
       .join("\n")
       .trim();
-
-    return text;
   }
+  return String(content).trim();
+}
 
-  async function shareManualContinuation(prompt, ctx) {
-    const manualMessage = [
-      "Unable to start a new session automatically.",
-      "Use the continuation prompt below to resume in a fresh session.",
-      "",
-      prompt,
-    ].join("\n");
+// ---------------------------------------------------------------------------
+// Extension entry point
+// ---------------------------------------------------------------------------
 
-    await pi.sendMessage(
-      {
-        customType: "baton.manual",
-        content: manualMessage,
-        display: true,
-      },
-      {
-        triggerTurn: true,
+/**
+ * @param {import("@earendil-works/pi-coding-agent").ExtensionAPI} pi
+ */
+export default function (pi) {
+  // ---- Slash command: /baton [addendum] -----------------------------------
+
+  pi.registerCommand("baton", {
+    description:
+      "Restart the session with the last assistant response carried forward. " +
+      "Optionally append an addendum that is immediately sent to the agent.",
+
+    /** @param {string} args @param {import("@earendil-works/pi-coding-agent").ExtensionCommandContext} ctx */
+    handler: async (args, ctx) => {
+      const startTs = performance.now();
+      const addendum = (args ?? "").trim();
+      const truncatedAddendum = addendum.slice(0, MAX_ADDENDUM_LENGTH);
+
+      // 1. Wait for the agent to finish if it's still working.
+      if (typeof ctx.waitForIdle === "function") {
+        await ctx.waitForIdle();
       }
-    );
 
-    safeNotify(ctx, "Manual continuation prompt provided; copy it into a new session to proceed.", "warning");
-  }
+      // 2. Find the last assistant message in the current branch.
+      const branch = ctx.sessionManager.getBranch();
+      const lastAssistant = getLastAssistantMessage(branch);
 
-  function safeNotify(ctx, message, level = "info") {
-    if (!ctx.hasUI) {
-      return;
-    }
-    ctx.ui.notify(message, level);
-  }
+      if (!lastAssistant) {
+        ctx.ui.notify(
+          "Cannot baton: no previous assistant response found.",
+          "error",
+        );
+        await debugLog("command", {
+          addendum,
+          branchLength: branch.length,
+          durationMs: Math.round(performance.now() - startTs),
+          ok: false,
+          error: "no previous assistant response",
+        });
+        return;
+      }
+
+      // 3. Extract the last assistant content as plain text.
+      const lastText = assistantContentToText(lastAssistant.content);
+
+      // 4. Start a fresh session.
+      //    - With addendum: auto-trigger the agent by sending the continuation
+      //      prompt as a user message.
+      //    - Without addendum: place the last context in the editor and wait
+      //      for the user to type their input.
+      let cancelled = false;
+      try {
+        const result = await ctx.newSession({
+          parentSession: ctx.sessionManager.getSessionFile() ?? undefined,
+
+          withSession: async (replacementCtx) => {
+            if (truncatedAddendum) {
+              // Auto-trigger: send context + addendum as a user message.
+              const prompt = `[Carrying forward from previous session]
+
+${lastText}
+
+🔔 Heads-Up:
+${truncatedAddendum}`;
+              await replacementCtx.sendUserMessage(prompt);
+            } else {
+              // No addendum: seed the editor and wait for user input.
+              const editorText = `[Carrying forward from previous session]
+
+${lastText}`;
+              replacementCtx.ui.setEditorText(editorText);
+              replacementCtx.ui.notify(
+                "baton ready. Waiting for your input.",
+                "info",
+              );
+            }
+          },
+        });
+
+        cancelled = result.cancelled;
+        if (cancelled) {
+          ctx.ui.notify("baton cancelled.", "info");
+        }
+      } finally {
+        await debugLog("command", {
+          addendum,
+          branchLength: branch.length,
+          durationMs: Math.round(performance.now() - startTs),
+          ok: !cancelled,
+        });
+      }
+    },
+  });
+
+  // ---- Tool: batondebug(message, data?) ----------------------------------
+  //
+  // Self-instrumentation tool the LLM can call to log arbitrary observations
+  // to the debug log for post-hoc analysis.
+
+  pi.registerTool({
+    name: "batondebug",
+    label: "baton Debug",
+    description:
+      "Log arbitrary debug info to the baton extension's debug log. " +
+      "Useful for self-instrumentation — call this whenever you want to " +
+      "record something interesting for later analysis.",
+
+    promptSnippet: "Log debug info to the baton extension debug log",
+    promptGuidelines: [
+      "Use batondebug to record observations, decisions, or state snapshots while working.",
+      "The log is written to baton-debug.jsonl adjacent to the baton extension.",
+    ],
+
+    parameters: Type.Object({
+      message: Type.String({
+        description: "Description of what's being logged.",
+      }),
+      data: Type.Optional(
+        Type.Object({}, {
+          additionalProperties: true,
+          description: "Optional structured data to include.",
+        }),
+      ),
+    }),
+
+    /**
+     * @param {string} _toolCallId
+     * @param {{ message: string; data?: Record<string, unknown> }} params
+     * @param {AbortSignal} _signal
+     * @param {(update: any) => void} _onUpdate
+     * @param {import("@earendil-works/pi-coding-agent").ExtensionContext} ctx
+     */
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const branch = ctx.sessionManager.getBranch();
+
+      await debugLog("batondebug", {
+        addendum: params.message,
+        branchLength: branch.length,
+        ok: true,
+        data: params.data ?? null,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Logged to debug log: ${params.message}`,
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  // ---- Tool: baton(addendum?) --------------------------------------------
+
+  pi.registerTool({
+    name: "baton",
+    label: "baton",
+    description:
+      "Start a new session seeded with the last assistant response, " +
+      "optionally with an addendum to guide the next turn. " +
+      "Use this when you want to continue work in a fresh session " +
+      "with context carried forward.",
+
+    promptSnippet: "Start a new session carrying forward the last response",
+    promptGuidelines: [
+      "Use baton when the conversation is getting long and you want a fresh session seeded with the last response.",
+      "Pass an addendum to immediately direct the agent in the new session (e.g., baton('Summarize the plan')).",
+    ],
+
+    parameters: Type.Object({
+      addendum: Type.Optional(
+        Type.String({
+          description:
+            "Optional guidance for the next turn (max " +
+            MAX_ADDENDUM_LENGTH +
+            " chars).",
+        }),
+      ),
+    }),
+
+    /**
+     * @param {string} _toolCallId
+     * @param {{ addendum?: string }} params
+     * @param {AbortSignal} _signal
+     * @param {(update: any) => void} _onUpdate
+     * @param {import("@earendil-works/pi-coding-agent").ExtensionContext} ctx
+     */
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const startTs = performance.now();
+
+      // Validate / sanitise.
+      const addendum = (params.addendum ?? "").trim().slice(
+        0,
+        MAX_ADDENDUM_LENGTH,
+      );
+
+      // Quick pre-flight: is there anything to baton from?
+      const branch = ctx.sessionManager.getBranch();
+      const lastMsg = getLastAssistantMessage(branch);
+      if (!lastMsg) {
+        await debugLog("tool", {
+          addendum,
+          branchLength: branch.length,
+          durationMs: Math.round(performance.now() - startTs),
+          ok: false,
+          error: "no previous assistant response",
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Cannot baton: no previous assistant response found in the " +
+                "current session.",
+            },
+          ],
+          details: {},
+          isError: true,
+        };
+      }
+
+      // Queue the /baton command as a follow-up user message so it runs
+      // after the current agent turn finishes.
+      pi.sendUserMessage(
+        addendum ? `/baton ${addendum}` : "/baton",
+        { deliverAs: "followUp" },
+      );
+
+      await debugLog("tool", {
+        addendum,
+        branchLength: branch.length,
+        durationMs: Math.round(performance.now() - startTs),
+        ok: true,
+      });
+
+      const summary = addendum
+        ? `baton queued with addendum. The session will restart carrying ` +
+          `forward the last response, then process: "${addendum}".`
+        : "baton queued. The session will restart carrying forward the " +
+          "last response.";
+
+      return {
+        content: [{ type: "text", text: summary }],
+        details: {},
+      };
+    },
+  });
 }
