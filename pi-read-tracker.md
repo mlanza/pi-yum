@@ -96,17 +96,16 @@ When provided, every `data`-typed arg is passed through this callback. The retur
 
 ### Collective context (`fileMemo`)
 
-File classification is not done in isolation — the library builds confidence across
-invocations by maintaining a **file memo**: a `Set` of absolute paths that have been
-confirmed as files during the session. Each call to `normalize` can both read from
-and contribute to this memo.
+`fileMemo` is a **simple oracle** — a `Set<string>` of absolute paths that have
+been confirmed as files during the session. The library can work with or without
+it; it's just one more factor in the discernment equation.
 
 ```js
-// Caller maintains the memo across invocations
+// Optional — the library works fine without it.
 const fileMemo = new Set();
 
-await normalize(invA, { cwd, fileMemo });  // confirms paths → adds to memo
-await normalize(invB, { cwd, fileMemo });  // consults memo during scoring
+await normalize(invA, { cwd, fileMemo });  // consults memo during scoring
+await normalize(invB, { cwd, fileMemo });  // memo grows from prior runs
 ```
 
 #### How the memo adds weight
@@ -131,20 +130,22 @@ similar to finding the file on disk. This lets the library recognise a path as
 a file even when the file has been renamed or deleted since it was first
 encountered — the collective context says "we've seen this as a file before".
 
-#### Memo lifecycle
+#### Memo lifecycle (no extra deps)
 
 The caller (e.g. the pi-read-tracker extension) owns the memo and is responsible
 for:
 
 1. **Seeding**: passing in paths that are already known to be files (e.g., from
-   session restore or from explicit `read` tool calls that the extension handles
-   directly).
+   session restore — the session *is* the persistence, no separate disk file).
 2. **Feeding**: after each `normalize` call, collecting any newly-confirmed
-   absolute paths from the result and adding them to the memo. Paths where
-   `questionable === 0` are strong candidates; paths with `questionable === 1`
-   may be added with lower confidence for future reference.
-3. **Persistence**: saving the memo across session boundaries (e.g., as part of
-   the persisted tracker state) so that collective context survives restarts.
+   absolute paths from the result and adding them to the memo.
+3. **Persistence**: the memo is re-seeded from session state on each restore.
+   No additional storage layer — it lives in memory and is rebuilt from the
+   session's tracked file set.
+
+**No extra dependencies.** The memo is purely ephemeral context passed through
+an optional parameter. The session (via `pi.appendEntry` / `getBranch`) already
+captures everything the extension needs to reconstruct the memo.
 
 #### Scoring sketch
 

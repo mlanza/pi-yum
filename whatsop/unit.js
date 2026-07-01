@@ -14,6 +14,7 @@
 
 import { normalize, compressPath } from "./core.js";
 import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { strict as assert } from "node:assert";
 
 
@@ -145,7 +146,7 @@ testAsync("read with absolute path", async () => {
     fullCommand: `read {"path":"${absPath}"}`,
   }, { cwd });
   const resources = findResources(r);
-  assert.ok(resources.some((a) => a.absolutePath && a.absolutePath.endsWith("notepad.md")));
+  assert.ok(resources.some((a) => a.location && a.location.endsWith("notepad.md")));
 });
 
 testAsync("edit with edits array creates data type", async () => {
@@ -219,7 +220,7 @@ testAsync("cd to directory produces resource", async () => {
     fullCommand: "cd D:/pi-yum/whatsop",
   }, { cwd });
   const resources = findResources(r);
-  assert.ok(resources.some((a) => a.absolutePath && a.absolutePath.includes("whatsop")),
+  assert.ok(resources.some((a) => a.location && a.location.includes("whatsop")),
     "cd to directory should produce resource for the directory");
 });
 
@@ -272,7 +273,130 @@ test("compressPath short enough already returns unchanged", () => {
   assert.equal(p, process.platform === "win32" ? "\\usr\\bin" : "/usr/bin");
 });
 
+// ─── 6. fileMemo — collective context oracle ────────────────────────────────
+
+testAsync("fileMemo boosts nonexistent path to resource in bash", async () => {
+  const memo = new Set([resolve(cwd, "some-gone-file.md")]);
+  const r = await normalize(
+    { origin: "bash", fullCommand: "cat some-gone-file.md" },
+    { cwd, fileMemo: memo },
+  );
+  const resources = findResources(r);
+  const match = resources.find((a) => a.arg === "some-gone-file.md");
+  assert.ok(match, "file in memo should be classified as resource even if absent");
+  assert.equal(match.questionable, 0, "memo-confirmed path should have questionable: 0");
+});
+
+testAsync("fileMemo boosts nonexistent path to resource in tool-call", async () => {
+  const memo = new Set([resolve(cwd, "vanished.py")]);
+  const r = await normalize(
+    { origin: "tool-call", fullCommand: 'read {"path":"vanished.py"}' },
+    { cwd, fileMemo: memo },
+  );
+  const resources = findResources(r);
+  const match = resources.find((a) => a.arg === "vanished.py");
+  assert.ok(match, "file in memo should be classified as resource even if absent");
+  assert.equal(match.questionable, 0, "memo-confirmed path should have questionable: 0");
+  assert.ok(match.location, "memo-confirmed path should include location");
+});
+
+testAsync("fileMemo is optional — works without it", async () => {
+  // A nonexistent bare word without extension should NOT be a resource when no memo
+  const r = await normalize(
+    { origin: "bash", fullCommand: "cat no-such-file-without-ext" },
+    { cwd },
+  );
+  const resources = findResources(r);
+  const match = resources.find((a) => a.arg === "no-such-file-without-ext");
+  assert.ok(!match, "absent bare word without memo should NOT be a resource");
+});
+
+testAsync("fileMemo doesn't override flag logic", async () => {
+  const memo = new Set([resolve(cwd, "--help")]);
+  const r = await normalize(
+    { origin: "bash", fullCommand: "cat --help" },
+    { cwd, fileMemo: memo },
+  );
+  const resources = findResources(r);
+  // --help starts with "-", so isPathCandidate returns false — memo shouldn't override that
+  const match = resources.find((a) => a.arg === "--help");
+  assert.ok(!match, "--help should not be a resource even if in memo");
+});
+
+// ─── 7. False-positive rejection ───────────────────────────────────────────
+
+testAsync("User-Agent string with parens is not a resource", async () => {
+  const r = await normalize({
+    origin: "bash",
+    fullCommand: 'curl -sL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" https://boardgamegeek.com',
+  }, { cwd });
+  // The URL should be classified as a resource
+  const urlResources = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location === "https://boardgamegeek.com")
+  );
+  assert.ok(urlResources.length > 0, "URL should still be classified as resource");
+  // The User-Agent string should NOT be classified as a resource
+  const uaResources = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location && a.location.includes("Mozilla"))
+  );
+  assert.equal(uaResources.length, 0, "User-Agent string should NOT be a resource");
+  // And no filesystem-garbage paths
+  const garbagePaths = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location && a.location.includes(":\\") && a.location.includes("Mozilla"))
+  );
+  assert.equal(garbagePaths.length, 0, "no filesystem garbage paths from UA string");
+});
+
+// ─── 8. URL resources — separate from filesystem paths ──────────────────────
+
+testAsync("URL in bash is classified as resource via location", async () => {
+  const r = await normalize({
+    origin: "bash",
+    fullCommand: "curl https://boardgamegeek.com",
+  }, { cwd });
+  const matches = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location === "https://boardgamegeek.com")
+  );
+  assert.ok(matches.length > 0, "URL should be classified as resource with location");
+  assert.equal(matches[0].questionable, 0, "URL resource should have questionable: 0");
+});
+
+testAsync("URL with path in bash is classified as resource", async () => {
+  const r = await normalize({
+    origin: "bash",
+    fullCommand: "curl https://example.com/file.txt",
+  }, { cwd });
+  const resources = findResources(r);
+  assert.ok(resources.some((a) => a.arg === "https://example.com/file.txt"),
+    "URL with path should be classified as resource");
+});
+
+testAsync("URL in tool-call is classified as resource via location", async () => {
+  const r = await normalize({
+    origin: "tool-call",
+    fullCommand: 'read {"path":"https://boardgamegeek.com"}',
+  }, { cwd });
+  const matches = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location === "https://boardgamegeek.com")
+  );
+  assert.ok(matches.length > 0, "URL in tool-call should be classified as resource with location");
+});
+
+testAsync("curl --help does not produce a URL resource", async () => {
+  const r = await normalize({
+    origin: "bash",
+    fullCommand: "curl --help",
+  }, { cwd });
+  const urlResources = r.subcommands.flatMap((sc) =>
+    sc.args.filter((a) => a.type === "resource" && a.location && /^https?:\/\//i.test(a.location))
+  );
+  assert.equal(urlResources.length, 0, "--help should not produce a URL resource");
+});
+
 // ─── 5. Integration: replay JSONL logs ──────────────────────────────────────
+// Note: these tests are slower (~5-10s per file on Windows) because each
+// invocation triggers which/where (execSync) for actor resolution via PATH.
+// The 3s timeout on execSync keeps it bounded.
 
 async function replayJsonl(filePath) {
   const content = readFileSync(filePath, "utf-8");

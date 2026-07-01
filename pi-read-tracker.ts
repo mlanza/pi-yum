@@ -1,4 +1,3 @@
-
 /**
  * Read Tracker Extension
  *
@@ -9,7 +8,8 @@
  *   /read-tracker         – toggle widget visibility
  *   /read-tracker clear   – clear tracked files from current session
  *
- * Placement: ~/.pi/agent/extensions/read-tracker/index.ts
+ * Source: pi-read-tracker.ts
+ * Deploy: ~/.pi/agent/extensions/read-tracker/index.ts
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,14 +22,18 @@ import { pathToFileURL } from "node:url";
 
 // ─── Data model ─────────────────────────────────────────────────────────────
 
+type ReadType = "file" | "resource";
+
 interface FileReadStats {
-  /** Absolute path to the file */
+  /** Absolute path for files; URL for network resources */
   path: string;
+  /** Distinguishes local files from network resources */
+  type: ReadType;
   /** How many times this file has been read */
   readCount: number;
-  /** Whether the file lives outside the current session cwd */
+  /** Whether the file lives outside the current session cwd (files only) */
   external: boolean;
-  /** Whether the path exists on disk */
+  /** Whether the path exists on disk (files only) */
   verified: boolean;
   /** Timestamp (ms) of the most recent read */
   lastRead: number;
@@ -71,7 +75,7 @@ function isExternalPath(absPath: string, cwd: string): boolean {
 }
 
 const VALID_FILENAME_RX = /^[A-Za-z0-9._-]+$/;
-const READ_COMMANDS = new Set(["cat","grep","less","more","head","tail","sed","awk","sort","wc"]);
+const READ_COMMANDS = new Set(["cat","grep","less","more","head","tail","sed","awk","sort","wc","curl","wget"]);
 const QUESTIONABLE_READ_COMMANDS = new Set(["rg"]);
 
 type PathTransform = (value: string, cwd: string) => string;
@@ -86,8 +90,6 @@ const ensureAbsolutePath: PathTransform = (value, cwd) => isAbsolute(value) ? va
  */
 const normalizeDriveLetter: PathTransform = (value, _cwd) => {
   if (process.platform !== "win32") return value;
-  // Match ^/c/ or ^\\c\\ where c is a single letter (the Git Bash drive shorthand)
-  // and uppercase the drive letter for canonical form.
   return value.replace(/^[/\\]([a-zA-Z])[/\\]/, (_, letter) => `${letter.toUpperCase()}:/`);
 };
 
@@ -115,8 +117,6 @@ function resolveFileCandidate(candidate: string, cwd: string): { path: string; f
     verified = false;
   }
   // Reject bare-word basenames that don't exist — likely search patterns, not files.
-  // Check the basename, not the raw candidate string, so absolute paths like
-  // D:\\pi-yum\\confirmed are correctly rejected even though they contain separators.
   if (!verified) {
     const hasExtension = /\.[A-Za-z0-9]+$/.test(filename);
     const isDotfile = filename.startsWith(".");
@@ -129,6 +129,8 @@ function resolveFileCandidate(candidate: string, cwd: string): { path: string; f
 
 export default function readTracker(pi: ExtensionAPI): void {
   const fileMap = new Map<string, FileReadStats>();
+  /** Simple oracle: absolute paths confirmed as files this session. No extra deps. */
+  const fileMemo = new Set<string>();
   let widgetEnabled = true;
   let fileLimit = 8;
   let showAll = false;
@@ -171,8 +173,6 @@ export default function readTracker(pi: ExtensionAPI): void {
   /**
    * Compress a directory path to fit within available width using whatsop's
    * compressPath, falling back to the raw path if unavailable.
-   * Only absolute paths are compressed — relative subdirectory labels are
-   * always short enough to fit.
    */
   function _compressPathLabel(pathLabel: string, availWidth: number): string {
     if (!pathLabel || !_compressPath || !isAbsolute(pathLabel)) return pathLabel;
@@ -199,7 +199,7 @@ export default function readTracker(pi: ExtensionAPI): void {
           {
             arg: data,
             type: "resource",
-            absolutePath: resolved.path,
+            location: resolved.path,
             questionable: resolved.verified ? 0 : 1,
           },
         ];
@@ -216,7 +216,7 @@ export default function readTracker(pi: ExtensionAPI): void {
             {
               arg: pathVal,
               type: "resource",
-              absolutePath: resolved.path,
+              location: resolved.path,
               questionable: resolved.verified ? 0 : 1,
             },
           ];
@@ -237,6 +237,7 @@ export default function readTracker(pi: ExtensionAPI): void {
 
   function restoreFromSession(ctx: ExtensionContext): void {
     fileMap.clear();
+    fileMemo.clear();
     const entries = ctx.sessionManager.getBranch();
     let lastState: PersistedState | undefined;
     for (const entry of entries) {
@@ -249,17 +250,38 @@ export default function readTracker(pi: ExtensionAPI): void {
       fileLimit = lastState.fileLimit ?? 8;
       showAll = lastState.showAll ?? false;
       for (const f of lastState.files ?? []) {
-        const resolved = resolveFileCandidate(f.path, cwd);
-        if (!resolved) continue;
-        const normalized: FileReadStats = {
-          path: resolved.path,
-          readCount: typeof f.readCount === "number" ? f.readCount : 0,
-          external: isExternalPath(resolved.path, cwd),
-          verified: Boolean(f.verified) || resolved.verified,
-          lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
-          questionable: Boolean(f.questionable),
-        };
-        fileMap.set(normalized.path, normalized);
+        const readType: ReadType = f.type === "resource" ? "resource" : "file";
+        // Skip entries with parenthesized paths — they are old false positives
+        // from the pre-location era where User-Agent strings were classified as
+        // filesystem paths (e.g. "Mozilla/5.0 (Windows NT...)").
+        if (typeof f.path === "string" && /[()]/.test(f.path)) continue;
+        if (readType === "resource") {
+          // Resources stored as-is — no filesystem validation
+          fileMap.set(f.path, {
+            path: f.path,
+            type: "resource",
+            readCount: typeof f.readCount === "number" ? f.readCount : 0,
+            external: true,
+            verified: false,
+            lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
+            questionable: Boolean(f.questionable),
+          });
+        } else {
+          const resolved = resolveFileCandidate(f.path, cwd);
+          if (!resolved) continue;
+          const normalized: FileReadStats = {
+            path: resolved.path,
+            type: "file",
+            readCount: typeof f.readCount === "number" ? f.readCount : 0,
+            external: isExternalPath(resolved.path, cwd),
+            verified: Boolean(f.verified) || resolved.verified,
+            lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
+            questionable: Boolean(f.questionable),
+          };
+          fileMap.set(normalized.path, normalized);
+          // Seed the file memo from verified paths
+          if (normalized.verified) fileMemo.add(normalized.path);
+        }
       }
     }
   }
@@ -274,7 +296,6 @@ export default function readTracker(pi: ExtensionAPI): void {
 
     const sorted = [...files];
     const cwdSnap = cwd;
-    // Sort entries with the most recently read files first so the widget stays focused on fresh context
     sorted.sort((a, b) => (b.lastRead ?? 0) - (a.lastRead ?? 0));
 
     const totalCount = sorted.length;
@@ -304,55 +325,65 @@ export default function readTracker(pi: ExtensionAPI): void {
 
           // File rows
           for (const f of visibleFiles) {
-            const filename = basename(f.path);
-            const parentAbs = dirname(f.path);
+            const filename = f.type === "resource"
+              ? f.path  // show the full URL for network resources
+              : basename(f.path);
             const dimSep = theme.fg("dim", " | ");
             const gutterParts: string[] = [];
             if (f.questionable) gutterParts.push("❓");
-            if (f.external) gutterParts.push("⚠️");
+            if (f.type === "resource") gutterParts.push("🌐");
+            if (f.type === "file" && f.external) gutterParts.push("⚠️");
             const gutter = gutterParts.length ? `${gutterParts.join("")} ` : "   ";
-            const exists = (() => {
-              try {
-                return existsSync(f.path);
-              } catch {
-                return false;
-              }
-            })();
-            const isVerified = f.verified || exists;
-            const normCwd = normalizeSlashes(cwdSnap, cwdSnap).replace(/[\\/]+$/, "");
-            const normParent = normalizeSlashes(parentAbs, cwdSnap).replace(/[\\/]+$/, "");
-            const isDirectChild = normParent === normCwd;
-            const parentRelative = isDirectChild
-              ? ""
-              : normalizeSlashes(relative(cwdSnap, parentAbs), cwdSnap);
-            // Match the Edited files pane: no path for direct children,
-            // relative subdirectory (e.g. "normops") for nested files,
-            // absolute parent only when the file is outside the workspace.
-            const pathLabel = isDirectChild
-              ? ""
-              : f.external
-                ? parentAbs
-                : parentRelative;
-            const fileStr = isVerified
-              ? theme.fg("accent", theme.bold(filename))
-              : theme.fg("muted", theme.bold(filename));
-            const countStr = theme.fg("warning", `📖${f.readCount.toString().padStart(3, " ")}`);
 
-            // Calculate available width for the path and compress if needed
+            let fileStr: string;
             let pathStr = "";
-            if (pathLabel) {
-              const pathAvailWidth = Math.max(5, width
-                - visibleWidth(gutter)
-                - visibleWidth(dimSep)
-                - visibleWidth(fileStr)
-                - visibleWidth(dimSep)
-                - visibleWidth(countStr)
-                - 2);
-              const compressed = _compressPathLabel(pathLabel, pathAvailWidth);
-              pathStr = theme.fg("dim", compressed);
+            let countStr: string;
+
+            if (f.type === "resource") {
+              // Network resource — no filesystem ops, show URL directly
+              fileStr = theme.fg("accent", filename);
+              countStr = theme.fg("warning", `📖${f.readCount.toString().padStart(3, " ")}`);
+            } else {
+              // File — existing filesystem-aware rendering
+              const parentAbs = dirname(f.path);
+              const exists = (() => {
+                try {
+                  return existsSync(f.path);
+                } catch {
+                  return false;
+                }
+              })();
+              const isVerified = f.verified || exists;
+              const normCwd = normalizeSlashes(cwdSnap, cwdSnap).replace(/[\\/]+$/, "");
+              const normParent = normalizeSlashes(parentAbs, cwdSnap).replace(/[\\/]+$/, "");
+              const isDirectChild = normParent === normCwd;
+              const parentRelative = isDirectChild
+                ? ""
+                : normalizeSlashes(relative(cwdSnap, parentAbs), cwdSnap);
+              const pathLabel = isDirectChild
+                ? ""
+                : f.external
+                  ? parentAbs
+                  : parentRelative;
+              fileStr = isVerified
+                ? theme.fg("accent", theme.bold(filename))
+                : theme.fg("muted", theme.bold(filename));
+              countStr = theme.fg("warning", `📖${f.readCount.toString().padStart(3, " ")}`);
+
+              if (pathLabel) {
+                const pathAvailWidth = Math.max(5, width
+                  - visibleWidth(gutter)
+                  - visibleWidth(dimSep)
+                  - visibleWidth(fileStr)
+                  - visibleWidth(dimSep)
+                  - visibleWidth(countStr)
+                  - 2);
+                const compressed = _compressPathLabel(pathLabel, pathAvailWidth);
+                pathStr = theme.fg("dim", compressed);
+              }
             }
 
-            const leftPart = pathLabel
+            const leftPart = pathStr
               ? `${gutter}${dimSep}${fileStr}${dimSep}${pathStr}`
               : `${gutter}${dimSep}${fileStr}`;
 
@@ -378,18 +409,26 @@ export default function readTracker(pi: ExtensionAPI): void {
   }
 
   function accumulateRead(absPath: string, external: boolean, verified: boolean, questionable = false): void {
+    // Reject parenthesized paths — they are garbage from old UA-string false positives
+    if (/[()]/.test(absPath)) return;
     const now = Date.now();
     const existing = fileMap.get(absPath);
     if (existing) {
       existing.readCount++;
       existing.external = existing.external || external;
       existing.questionable = existing.questionable || questionable;
-      if (verified) {
-        existing.verified = true;
-      }
+      if (verified) existing.verified = true;
       existing.lastRead = now;
     } else {
-      fileMap.set(absPath, { path: absPath, readCount: 1, external, verified, lastRead: now, questionable });
+      fileMap.set(absPath, {
+        path: absPath,
+        type: "file",
+        readCount: 1,
+        external,
+        verified,
+        lastRead: now,
+        questionable,
+      });
     }
   }
 
@@ -410,7 +449,6 @@ export default function readTracker(pi: ExtensionAPI): void {
     await _loadWhatsop();
     updateWidget(ctx);
 
-    // Initialize session log only when the --read-tracker-log flag is active
     const sessionId = ctx.sessionManager.getSessionId();
     if (loggingEnabled && sessionId) {
       sessionLogPath = join(cwd, `${sessionId}.jsonl`);
@@ -426,7 +464,6 @@ export default function readTracker(pi: ExtensionAPI): void {
     await _loadWhatsop();
     updateWidget(ctx);
 
-    // The session may have changed; refresh the log path
     const sessionId = ctx.sessionManager.getSessionId();
     if (loggingEnabled && sessionId) {
       sessionLogPath = join(cwd, `${sessionId}.jsonl`);
@@ -441,7 +478,6 @@ export default function readTracker(pi: ExtensionAPI): void {
       pendingBashCommands.set(event.toolCallId, event.input.command || "");
       return;
     }
-    // Log all other tool calls as "tool-call" origin
     const input = event.input as Record<string, unknown>;
     const fullCommand = `${event.toolName} ${JSON.stringify(input)}`;
     logInvocation("tool-call", fullCommand);
@@ -477,53 +513,115 @@ export default function readTracker(pi: ExtensionAPI): void {
       if (normalize) {
         const result = await normalize(
           { origin, fullCommand },
-          { cwd, dataCallback: _dataCallback },
+          { cwd, dataCallback: _dataCallback, fileMemo },
         );
+
+        // Feed the memo: filesystem paths confirmed by this invocation become oracle knowledge.
+        // URLs are NOT added to the memo (the memo is filesystem-only).
+        for (const sub of result.subcommands ?? []) {
+          for (const arg of sub.args ?? []) {
+            if (arg.type === "resource" && arg.location && arg.questionable === 0 && !/^https?:\/\//i.test(arg.location)) {
+              fileMemo.add(arg.location);
+            }
+            if (arg.type === "data" && arg.expanded) {
+              for (const ea of arg.expanded) {
+                if (ea.type === "resource" && ea.location && ea.questionable === 0 && !/^https?:\/\//i.test(ea.location)) {
+                  fileMemo.add(ea.location);
+                }
+              }
+            }
+          }
+        }
 
         for (const sub of result.subcommands ?? []) {
           // For tool-call origins, only track the "read" tool
           if (origin === "tool-call" && event.toolName !== "read") continue;
-          // For bash origins, only track known read commands
+          // For bash origins, only track known read commands.
+          // Strip .exe/.com/.bat/.cmd so resolved paths match the set keys on Windows.
           if (origin === "bash") {
-            const actorBase = basename(sub.actor);
+            const actorBase = basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, "");
             if (!READ_COMMANDS.has(actorBase) && !QUESTIONABLE_READ_COMMANDS.has(actorBase)) continue;
           }
 
           const isQuestionable =
             origin === "bash" &&
             sub.actor &&
-            QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor));
+            QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, ""));
 
           for (const arg of sub.args ?? []) {
-            // Validate resource args through resolveFileCandidate —
-            // this rejects bare-word basenames that don't exist on disk
-            // even when the path string contains separators (e.g. absolute paths).
-            if (arg.type === "resource" && arg.absolutePath) {
-              const resolved = resolveFileCandidate(arg.absolutePath, cwd);
-              if (resolved) {
-                accumulateRead(
-                  resolved.path,
-                  isExternalPath(resolved.path, cwd),
-                  resolved.verified || existsSync(resolved.path),
-                  isQuestionable || arg.questionable === 1,
-                );
+            // Use the unified `location` field. For URL resources (http/https),
+            // store directly as a network resource without filesystem resolution.
+            // For filesystem paths, validate through resolveFileCandidate.
+            if (arg.type === "resource" && arg.location) {
+              if (/^https?:\/\//i.test(arg.location)) {
+                // Network resource (URL) — store directly
+                const url = arg.location;
+                const now = Date.now();
+                const existing = fileMap.get(url);
+                if (existing) {
+                  existing.readCount++;
+                  existing.lastRead = now;
+                } else {
+                  fileMap.set(url, {
+                    path: url,
+                    type: "resource",
+                    readCount: 1,
+                    external: true,
+                    verified: false,
+                    lastRead: now,
+                    questionable: isQuestionable || arg.questionable === 1,
+                  });
+                }
                 tracked = true;
+              } else {
+                // Filesystem path — validate through resolveFileCandidate
+                const resolved = resolveFileCandidate(arg.location, cwd);
+                if (resolved) {
+                  accumulateRead(
+                    resolved.path,
+                    isExternalPath(resolved.path, cwd),
+                    resolved.verified || existsSync(resolved.path),
+                    isQuestionable || arg.questionable === 1,
+                  );
+                  tracked = true;
+                }
               }
             }
-            // Also process expanded nodes from dataCallback — these contain
-            // resources extracted from structured data payloads (e.g. edit.edits).
+            // Also process expanded nodes from dataCallback.
             if (arg.type === "data" && arg.expanded && arg.expanded.length > 0) {
               for (const expandedArg of arg.expanded) {
-                if (expandedArg.type === "resource" && expandedArg.absolutePath) {
-                  const resolved = resolveFileCandidate(expandedArg.absolutePath, cwd);
-                  if (resolved) {
-                    accumulateRead(
-                      resolved.path,
-                      isExternalPath(resolved.path, cwd),
-                      resolved.verified || existsSync(resolved.path),
-                      isQuestionable || expandedArg.questionable === 1,
-                    );
+                if (expandedArg.type === "resource" && expandedArg.location) {
+                  if (/^https?:\/\//i.test(expandedArg.location)) {
+                    // URL resource from data expansion
+                    const url = expandedArg.location;
+                    const now = Date.now();
+                    const existing = fileMap.get(url);
+                    if (existing) {
+                      existing.readCount++;
+                      existing.lastRead = now;
+                    } else {
+                      fileMap.set(url, {
+                        path: url,
+                        type: "resource",
+                        readCount: 1,
+                        external: true,
+                        verified: false,
+                        lastRead: now,
+                        questionable: isQuestionable || expandedArg.questionable === 1,
+                      });
+                    }
                     tracked = true;
+                  } else {
+                    const resolved = resolveFileCandidate(expandedArg.location, cwd);
+                    if (resolved) {
+                      accumulateRead(
+                        resolved.path,
+                        isExternalPath(resolved.path, cwd),
+                        resolved.verified || existsSync(resolved.path),
+                        isQuestionable || expandedArg.questionable === 1,
+                      );
+                      tracked = true;
+                    }
                   }
                 }
               }
@@ -551,7 +649,28 @@ export default function readTracker(pi: ExtensionAPI): void {
           for (const arg of args) {
             if (!arg.startsWith("-") && !arg.includes("=")) {
               const p = arg.replace(/^['"]|['"]$/g, "");
-              if (trackReadCandidate(p, isQuestionable)) tracked = true;
+              // If it looks like a URL, store as a resource — no path resolution
+              if (/^https?:\/\//i.test(p)) {
+                const now = Date.now();
+                const existing = fileMap.get(p);
+                if (existing) {
+                  existing.readCount++;
+                  existing.lastRead = now;
+                } else {
+                  fileMap.set(p, {
+                    path: p,
+                    type: "resource",
+                    readCount: 1,
+                    external: true,
+                    verified: false,
+                    lastRead: now,
+                    questionable: isQuestionable,
+                  });
+                }
+                tracked = true;
+              } else if (trackReadCandidate(p, isQuestionable)) {
+                tracked = true;
+              }
             }
           }
         }
