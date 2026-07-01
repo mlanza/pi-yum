@@ -18,6 +18,12 @@ const DEFAULT_CWD = process.cwd();
 /** Regex for valid bare filenames (excludes pure digits). */
 const BASENAME_RX = /^(?!\d+$)[A-Za-z0-9._-]+$/;
 
+/** On Windows, reject short /X patterns that are typically flags, not paths. */
+const isWindowsFlag = (str) => {
+  if (process.platform !== "win32") return false;
+  return /^\/[A-Za-z0-9]{1,3}$/.test(str);
+};
+
 /**
  * Common path-like indicators for heuristic classification.
  * Matches strings that:
@@ -37,6 +43,7 @@ const isPathCandidate = (str) =>
   && !/^\d+$/.test(str)
   && !str.includes("\n")
   && str.length <= 256
+  && !isWindowsFlag(str)
   && (PATH_LIKE_RX.test(str) || BASENAME_RX.test(str));
 
 /** Check if a string looks like a URL. */
@@ -142,10 +149,20 @@ const classifyBashToken = (token, cwd) => {
   const isActor = /\.(js|ts|mjs|cjs|mts|cts|py|rb|sh|bash|pl|php)$/i.test(raw)
     || ["node","deno","bun","python","python3","ruby","bash","sh","zsh","npx","yarn"].includes(raw);
 
+  // Glob patterns (e.g. *.ts) are not actors — they're shell wildcards
+  if (/[*?]/.test(raw)) {
+    return { arg: token, type: "arg" };
+  }
+
   if (isActor) {
     const absPath = resolvePath(raw, cwd);
     const exists = pathExists(absPath);
     return { arg: token, type: "actor", absolutePath: exists ? absPath : null, questionable: exists ? 0 : 1 };
+  }
+
+  // Shell redirect operators (e.g. 2>/dev/null, >, 2>&1) are not file paths
+  if (/^\d*[<>]/.test(raw)) {
+    return { arg: token, type: "arg" };
   }
 
   if (isPathCandidate(raw) || isUrlCandidate(raw)) {
