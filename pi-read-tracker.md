@@ -304,3 +304,45 @@ To enable testing and validation of the normalization library, the extension wil
 ```
 
 This log captures a faithful trace of what the agent saw and serves as the source of truth for replaying through `cli.js` and for future analysis.
+
+### Cd-Context Resolver (`whatsop/contextualizer.js`) — Pop-off Layer
+
+A self-contained, optional pre-processing stage that detects `cd` directives in
+compound bash commands and computes the effective working directory for each
+subcommand segment.
+
+**FP pipeline:**
+
+```
+contextualizer.resolveCds(command, cwd)
+  → [{ command: 'cd /tmp',  cwd: '/home/user' },
+     { command: 'cat file', cwd: '/tmp' }]
+  → for each segment: normalize({ command }, { cwd })
+  → merge results
+```
+
+When the contextualizer is active, relative paths in subcommands that follow a
+`cd <dir>` are resolved against the `cd` target.  For example:
+
+```bash
+cd /target/dir && cat docs/extensions.md
+```
+
+resolves `docs/extensions.md` → `/target/dir/docs/extensions.md` instead of the
+process working directory.
+
+**Pop-off design:** The contextualizer is imported and called only from the
+extension's `discoverTrackedFiles` function.  If it proves unreliable or
+unnecessary, simply remove the dynamic import — the extension falls through to
+calling `normalize()` with the original `cwd`, which behaves exactly as before.
+No other code needs to change.
+
+**Boundaries:**
+
+| Operator | Cd context carries? |
+|----------|---------------------|
+| `&&`, `\|\|`, `;` | Yes — `cd` in one segment affects subsequent segments |
+| `\|` (pipe) | No — pipes split the command independently |
+
+**Module location:** `whatsop/contextualizer.js` (co-located with `core.js`).
+The extension lazy-imports it via `import()` from the workspace root.

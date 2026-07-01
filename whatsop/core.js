@@ -88,8 +88,13 @@ const resolvePath = (candidate, cwd) => {
 /** Check if a resolved path exists on disk. */
 const pathExists = (absPath) => { try { return existsSync(absPath); } catch { return false; } };
 
-/** Try `which` (or `where` on Windows) to resolve a bare command name. */
+/** Try `which` (or `where` on Windows) to resolve a bare command name.
+ *
+ * Results are cached by command name to avoid repeated subprocess spawns.
+ * Use `whichSync._cache` to inspect or clear the cache if needed.
+ */
 const whichSync = (cmd) => {
+  if (whichSync._cache.has(cmd)) return whichSync._cache.get(cmd) ?? null;
   const tool = process.platform === "win32" ? "where" : "which";
   try {
     const out = execSync(`${tool} "${cmd}"`, {
@@ -98,9 +103,15 @@ const whichSync = (cmd) => {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 3000,
     });
-    return out.trim().split(/\r?\n/)[0] || null;
-  } catch { return null; }
+    const result = out.trim().split(/\r?\n/)[0] || null;
+    whichSync._cache.set(cmd, result);
+    return result;
+  } catch {
+    whichSync._cache.set(cmd, null);
+    return null;
+  }
 };
+whichSync._cache = new Map();
 
 // ─── Bash tokenisation (character-wise, returns new arrays) ─────────────────
 

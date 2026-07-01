@@ -228,6 +228,8 @@ export default function readTracker(pi: ExtensionAPI): void {
     | ((dirPath: string, maxWidth: number) => string)
     | null
     | undefined;
+  /** Guard against concurrent on-demand audit reconstructions. */
+  let _reconstructionInProgress = false;
 
   /** Lazy-load whatsop from the workspace directory. */
   async function _loadWhatsop(): Promise<typeof _whatsopNormalize> {
@@ -376,31 +378,9 @@ export default function readTracker(pi: ExtensionAPI): void {
       }
     }
 
-    // Reconstruct audit log from session entries when:
-    // - No audit log was persisted (pre-audit sessions), OR
-    // - The persisted entries lack toolCallId (pre-toolCallId sessions).
-    const needsReconstruction =
-      commandAuditLog.size === 0 ||
-      (() => {
-        for (const entries of commandAuditLog.values()) {
-          for (const e of entries) {
-            if (!e.toolCallId) return true;
-          }
-        }
-        return false;
-      })();
-
-    if (needsReconstruction && entries.length > 0) {
-      commandAuditLog.clear();
-      await _loadWhatsop();
-      await reconstructAuditFromSession(entries);
-
-      // Reconcile readCount: reads == commands
-      for (const fStats of fileMap.values()) {
-        const al = commandAuditLog.get(fStats.path);
-        if (al) fStats.readCount = al.length;
-      }
-    }
+    // Note: Audit trail reconstruction is NOT done on session restore.
+    // It happens on-demand when the user invokes /read-tracker audit, so
+    // that session resume stays fast.  See the audit handler below.
   }
 
   function updateWidget(ctx: ExtensionContext): void {
@@ -615,87 +595,133 @@ export default function readTracker(pi: ExtensionAPI): void {
     toolName: string,
     input: Record<string, any> | undefined,
   ): Promise<DiscoveredFile[]> {
+    // ── Early out: non-read commands never produce resources ──────────────
+    // This avoids running the expensive whatsop normalize (which spawns
+    // subprocesses via which/where) for every edit, write, node, npm, etc.
+    if (origin === "tool-call" && toolName !== "read") return [];
+    if (origin === "bash") {
+      // A bash command may be compound (cd X && cat Y, echo | grep foo, etc.).
+      // Check whether ANY subcommand in the chain is a known READ command.
+      // Split by logical operators and pipes — cheap, no tokenizer needed just for filtering.
+      const chainParts = fullCommand.trim().split(/\s*(?:&&|\|\||;)\s*/);
+      const hasReadCommand = chainParts.some((part) => {
+        // Also split pipes within each logical part
+        const pipeParts = part.split(/\s*\|\s*/);
+        return pipeParts.some((p) => {
+          const firstWord = p.trim().split(/\s+/)[0] || "";
+          const base = firstWord.includes("/")
+            ? firstWord.slice(firstWord.lastIndexOf("/") + 1)
+            : firstWord;
+          return READ_COMMANDS.has(base) || QUESTIONABLE_READ_COMMANDS.has(base);
+        });
+      });
+      if (!hasReadCommand) return [];
+    }
+
     const files: DiscoveredFile[] = [];
     const dedupSet = new Set<string>();
     let trackedByWhatsop = false;
 
-    // ── Try whatsop-based tracking ────────────────────────────────────────
-    try {
-      const normalize = await _loadWhatsop();
-      if (normalize) {
-        const result = await normalize(
-          { origin, fullCommand },
-          { cwd, dataCallback: _dataCallback, fileMemo },
-        );
-
-        // Feed the memo (same as live code — harmless during replay since the
-        // set is already seeded from restored PersistedState).
-        for (const sub of result.subcommands ?? []) {
-          for (const arg of sub.args ?? []) {
-            if (arg.type === "resource" && arg.location && arg.questionable === 0 && !/^https?:\/\//i.test(arg.location)) {
-              fileMemo.add(arg.location);
-            }
-            if (arg.type === "data" && arg.expanded) {
-              for (const ea of arg.expanded) {
-                if (ea.type === "resource" && ea.location && ea.questionable === 0 && !/^https?:\/\//i.test(ea.location)) {
-                  fileMemo.add(ea.location);
-                }
+    /** Feed fileMemo and extract DiscoveredFile[] from a normalize result. */
+    const ingestNormalizeResult = (result, resultOrigin) => {
+      // Feed the memo
+      for (const sub of result.subcommands ?? []) {
+        for (const arg of sub.args ?? []) {
+          if (arg.type === "resource" && arg.location && arg.questionable === 0 && !/^https?:\/\//i.test(arg.location)) {
+            fileMemo.add(arg.location);
+          }
+          if (arg.type === "data" && arg.expanded) {
+            for (const ea of arg.expanded) {
+              if (ea.type === "resource" && ea.location && ea.questionable === 0 && !/^https?:\/\//i.test(ea.location)) {
+                fileMemo.add(ea.location);
               }
             }
           }
         }
+      }
 
-        for (const sub of result.subcommands ?? []) {
-          // For tool-call origins, only track the "read" tool
-          if (origin === "tool-call" && toolName !== "read") continue;
-          // For bash origins, only track known read commands
-          if (origin === "bash") {
-            const actorBase = basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, "");
-            if (!READ_COMMANDS.has(actorBase) && !QUESTIONABLE_READ_COMMANDS.has(actorBase)) continue;
-          }
+      for (const sub of result.subcommands ?? []) {
+        // For tool-call origins, only track the "read" tool
+        if (resultOrigin === "tool-call" && toolName !== "read") continue;
+        // For bash origins, only track known read commands
+        if (resultOrigin === "bash") {
+          const actorBase = basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, "");
+          if (!READ_COMMANDS.has(actorBase) && !QUESTIONABLE_READ_COMMANDS.has(actorBase)) continue;
+        }
 
-          const isQuestionable =
-            origin === "bash" &&
-            sub.actor &&
-            QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, ""));
+        const isQuestionable =
+          resultOrigin === "bash" &&
+          sub.actor &&
+          QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, ""));
 
-          for (const arg of sub.args ?? []) {
-            if (arg.type === "resource" && arg.location) {
-              if (/^https?:\/\//i.test(arg.location)) {
-                if (dedupSet.has(arg.location)) continue;
-                dedupSet.add(arg.location);
-                files.push({ absPath: arg.location, type: "resource", external: true, verified: false, questionable: isQuestionable || arg.questionable === 1 });
+        for (const arg of sub.args ?? []) {
+          if (arg.type === "resource" && arg.location) {
+            if (/^https?:\/\//i.test(arg.location)) {
+              if (dedupSet.has(arg.location)) continue;
+              dedupSet.add(arg.location);
+              files.push({ absPath: arg.location, type: "resource", external: true, verified: false, questionable: isQuestionable || arg.questionable === 1 });
+              trackedByWhatsop = true;
+            } else {
+              const resolved = resolveFileCandidate(arg.location, cwd);
+              if (resolved && !dedupSet.has(resolved.path)) {
+                dedupSet.add(resolved.path);
+                files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || arg.questionable === 1 });
                 trackedByWhatsop = true;
-              } else {
-                const resolved = resolveFileCandidate(arg.location, cwd);
-                if (resolved && !dedupSet.has(resolved.path)) {
-                  dedupSet.add(resolved.path);
-                  files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || arg.questionable === 1 });
-                  trackedByWhatsop = true;
-                }
               }
             }
-            if (arg.type === "data" && arg.expanded && arg.expanded.length > 0) {
-              for (const ea of arg.expanded) {
-                if (ea.type === "resource" && ea.location) {
-                  if (/^https?:\/\//i.test(ea.location)) {
-                    if (dedupSet.has(ea.location)) continue;
-                    dedupSet.add(ea.location);
-                    files.push({ absPath: ea.location, type: "resource", external: true, verified: false, questionable: isQuestionable || ea.questionable === 1 });
+          }
+          if (arg.type === "data" && arg.expanded && arg.expanded.length > 0) {
+            for (const ea of arg.expanded) {
+              if (ea.type === "resource" && ea.location) {
+                if (/^https?:\/\//i.test(ea.location)) {
+                  if (dedupSet.has(ea.location)) continue;
+                  dedupSet.add(ea.location);
+                  files.push({ absPath: ea.location, type: "resource", external: true, verified: false, questionable: isQuestionable || ea.questionable === 1 });
+                  trackedByWhatsop = true;
+                } else {
+                  const resolved = resolveFileCandidate(ea.location, cwd);
+                  if (resolved && !dedupSet.has(resolved.path)) {
+                    dedupSet.add(resolved.path);
+                    files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || ea.questionable === 1 });
                     trackedByWhatsop = true;
-                  } else {
-                    const resolved = resolveFileCandidate(ea.location, cwd);
-                    if (resolved && !dedupSet.has(resolved.path)) {
-                      dedupSet.add(resolved.path);
-                      files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || ea.questionable === 1 });
-                      trackedByWhatsop = true;
-                    }
                   }
                 }
               }
             }
           }
         }
+      }
+    };
+
+    // ── Try whatsop-based tracking ────────────────────────────────────────
+    try {
+      const normalize = await _loadWhatsop();
+      if (normalize) {
+        // ── Optional cd-context resolution (pop-off layer) ──────────────
+        // Try to load the contextualizer. If present, it transforms the
+        // command string: consumes `cd` directives, rewrites relative file
+        // paths to absolute.  If absent, the command passes through unchanged.
+        let commandToNormalize = fullCommand;
+        if (origin === "bash") {
+          try {
+            const ctxModPath = pathToFileURL(join(cwd, "whatsop/contextualizer.js")).href;
+            const contextualizer = await import(ctxModPath);
+            if (typeof contextualizer?.contextualize === "function") {
+              const transformed = contextualizer.contextualize(fullCommand, cwd);
+              if (transformed !== fullCommand) {
+                commandToNormalize = transformed;
+              }
+            }
+          } catch {
+            // contextualizer unavailable — pop-off: just use default path
+          }
+        }
+
+        const result = await normalize(
+          { origin, fullCommand: commandToNormalize },
+          { cwd, dataCallback: _dataCallback, fileMemo },
+        );
+        ingestNormalizeResult(result, origin);
       }
     } catch {
       // whatsop failed; fall through to manual tracking
@@ -1013,6 +1039,29 @@ export default function readTracker(pi: ExtensionAPI): void {
         if (!targetFile) {
           ctx.ui.notify("Could not resolve selected file", "warning");
           return;
+        }
+
+        // ── On-demand audit reconstruction ────────────────────────────────
+        // If no audit trail exists (pre-audit sessions), rebuild it now
+        // from the session stream so the user gets the full picture.
+        if (!_reconstructionInProgress && (commandAuditLog.size === 0 || !commandAuditLog.has(targetFile.path))) {
+          _reconstructionInProgress = true;
+          ctx.ui.notify(`Reconstructing audit trail…`, "info");
+          try {
+            commandAuditLog.clear();
+            await _loadWhatsop();
+            const entries = ctx.sessionManager.getBranch();
+            await reconstructAuditFromSession(entries);
+
+            // Reconcile readCount: reads == commands (in case the audit
+            // uncovered commands that the persisted fileMap missed).
+            for (const fStats of fileMap.values()) {
+              const al = commandAuditLog.get(fStats.path);
+              if (al) fStats.readCount = al.length;
+            }
+          } finally {
+            _reconstructionInProgress = false;
+          }
         }
 
         // Look up audit entries for this file
