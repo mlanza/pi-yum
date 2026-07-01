@@ -5,8 +5,11 @@
  * the agent has read during the current session, along with per-file read counts.
  *
  * Commands:
- *   /read-tracker         – toggle widget visibility
- *   /read-tracker clear   – clear tracked files from current session
+ *   /read-tracker                – toggle widget visibility
+ *   /read-tracker clear          – clear tracked files from current session
+ *   /read-tracker all            – toggle showing every tracked file
+ *   /read-tracker limit <N>       – cap visible files, exit show-all mode
+ *   /read-tracker audit        – interactively pick a file and trace its commands
  *
  * Source: pi-read-tracker.ts
  * Deploy: ~/.pi/agent/extensions/read-tracker/index.ts
@@ -46,6 +49,45 @@ interface PersistedState {
   enabled: boolean;
   fileLimit?: number;
   showAll?: boolean;
+  auditLog?: Record<string, AuditEntry[]>;
+}
+
+// ─── Audit trail ────────────────────────────────────────────────────────────
+
+interface AuditEntry {
+  /** Milliseconds since epoch */
+  timestamp: number;
+  /** Invocation source: "bash" or "tool-call" */
+  origin: string;
+  /** The full raw command string */
+  fullCommand: string;
+}
+
+/** Map from file path → audit entries for every command that touched it */
+const commandAuditLog = new Map<string, AuditEntry[]>();
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function recordAudit(filePath: string, origin: string, fullCommand: string): void {
+  const entry: AuditEntry = { timestamp: Date.now(), origin, fullCommand };
+  const entries = commandAuditLog.get(filePath);
+  if (entries) {
+    entries.push(entry);
+  } else {
+    commandAuditLog.set(filePath, [entry]);
+  }
+}
+
+function relativeTime(ts: number): string {
+  const diffMs = Date.now() - ts;
+  const diffSec = Math.floor(diffMs / 1000);
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
 }
 
 // ─── JSONL data collection ───────────────────────────────────────────────────
@@ -227,17 +269,23 @@ export default function readTracker(pi: ExtensionAPI): void {
   }
 
   function persistState(): void {
+    const auditLog: Record<string, AuditEntry[]> = {};
+    for (const [path, entries] of commandAuditLog) {
+      auditLog[path] = entries;
+    }
     pi.appendEntry("read-tracker", {
       files: [...fileMap.values()],
       enabled: widgetEnabled,
       fileLimit,
       showAll,
+      auditLog: Object.keys(auditLog).length > 0 ? auditLog : undefined,
     } satisfies PersistedState);
   }
 
   function restoreFromSession(ctx: ExtensionContext): void {
     fileMap.clear();
     fileMemo.clear();
+    commandAuditLog.clear();
     const entries = ctx.sessionManager.getBranch();
     let lastState: PersistedState | undefined;
     for (const entry of entries) {
@@ -249,6 +297,12 @@ export default function readTracker(pi: ExtensionAPI): void {
       widgetEnabled = lastState.enabled ?? true;
       fileLimit = lastState.fileLimit ?? 8;
       showAll = lastState.showAll ?? false;
+      // Restore audit log
+      if (lastState.auditLog) {
+        for (const [path, entries] of Object.entries(lastState.auditLog)) {
+          commandAuditLog.set(path, entries);
+        }
+      }
       for (const f of lastState.files ?? []) {
         const readType: ReadType = f.type === "resource" ? "resource" : "file";
         // Skip entries with parenthesized paths — they are old false positives
@@ -408,7 +462,14 @@ export default function readTracker(pi: ExtensionAPI): void {
     });
   }
 
-  function accumulateRead(absPath: string, external: boolean, verified: boolean, questionable = false): void {
+  function accumulateRead(
+    absPath: string,
+    external: boolean,
+    verified: boolean,
+    questionable = false,
+    auditOrigin?: string,
+    auditCommand?: string,
+  ): void {
     // Reject parenthesized paths — they are garbage from old UA-string false positives
     if (/[()]/.test(absPath)) return;
     const now = Date.now();
@@ -430,14 +491,44 @@ export default function readTracker(pi: ExtensionAPI): void {
         questionable,
       });
     }
+    if (auditOrigin && auditCommand) {
+      recordAudit(absPath, auditOrigin, auditCommand);
+    }
   }
 
-  function trackReadCandidate(candidate: string, questionable = false): boolean {
+  function trackReadCandidate(
+    candidate: string,
+    questionable = false,
+    auditOrigin?: string,
+    auditCommand?: string,
+  ): boolean {
     const resolved = resolveFileCandidate(candidate, cwd);
     if (!resolved) return false;
     const external = isExternalPath(resolved.path, cwd);
-    accumulateRead(resolved.path, external, resolved.verified, questionable);
+    accumulateRead(resolved.path, external, resolved.verified, questionable, auditOrigin, auditCommand);
     return true;
+  }
+
+  function trackUrlResource(url: string, questionable: boolean, auditOrigin?: string, auditCommand?: string): void {
+    const now = Date.now();
+    const existing = fileMap.get(url);
+    if (existing) {
+      existing.readCount++;
+      existing.lastRead = now;
+    } else {
+      fileMap.set(url, {
+        path: url,
+        type: "resource",
+        readCount: 1,
+        external: true,
+        verified: false,
+        lastRead: now,
+        questionable,
+      });
+    }
+    if (auditOrigin && auditCommand) {
+      recordAudit(url, auditOrigin, auditCommand);
+    }
   }
 
   // ── Events ───────────────────────────────────────────────────────────────
@@ -555,23 +646,7 @@ export default function readTracker(pi: ExtensionAPI): void {
             if (arg.type === "resource" && arg.location) {
               if (/^https?:\/\//i.test(arg.location)) {
                 // Network resource (URL) — store directly
-                const url = arg.location;
-                const now = Date.now();
-                const existing = fileMap.get(url);
-                if (existing) {
-                  existing.readCount++;
-                  existing.lastRead = now;
-                } else {
-                  fileMap.set(url, {
-                    path: url,
-                    type: "resource",
-                    readCount: 1,
-                    external: true,
-                    verified: false,
-                    lastRead: now,
-                    questionable: isQuestionable || arg.questionable === 1,
-                  });
-                }
+                trackUrlResource(arg.location, isQuestionable || arg.questionable === 1, origin, fullCommand);
                 tracked = true;
               } else {
                 // Filesystem path — validate through resolveFileCandidate
@@ -582,6 +657,8 @@ export default function readTracker(pi: ExtensionAPI): void {
                     isExternalPath(resolved.path, cwd),
                     resolved.verified || existsSync(resolved.path),
                     isQuestionable || arg.questionable === 1,
+                    origin,
+                    fullCommand,
                   );
                   tracked = true;
                 }
@@ -593,23 +670,7 @@ export default function readTracker(pi: ExtensionAPI): void {
                 if (expandedArg.type === "resource" && expandedArg.location) {
                   if (/^https?:\/\//i.test(expandedArg.location)) {
                     // URL resource from data expansion
-                    const url = expandedArg.location;
-                    const now = Date.now();
-                    const existing = fileMap.get(url);
-                    if (existing) {
-                      existing.readCount++;
-                      existing.lastRead = now;
-                    } else {
-                      fileMap.set(url, {
-                        path: url,
-                        type: "resource",
-                        readCount: 1,
-                        external: true,
-                        verified: false,
-                        lastRead: now,
-                        questionable: isQuestionable || expandedArg.questionable === 1,
-                      });
-                    }
+                    trackUrlResource(expandedArg.location, isQuestionable || expandedArg.questionable === 1, origin, fullCommand);
                     tracked = true;
                   } else {
                     const resolved = resolveFileCandidate(expandedArg.location, cwd);
@@ -619,6 +680,8 @@ export default function readTracker(pi: ExtensionAPI): void {
                         isExternalPath(resolved.path, cwd),
                         resolved.verified || existsSync(resolved.path),
                         isQuestionable || expandedArg.questionable === 1,
+                        origin,
+                        fullCommand,
                       );
                       tracked = true;
                     }
@@ -637,7 +700,7 @@ export default function readTracker(pi: ExtensionAPI): void {
     if (!tracked) {
       if (event.toolName === "read") {
         const input = event.input as { path: string };
-        if (trackReadCandidate(input.path)) tracked = true;
+        if (trackReadCandidate(input.path, false, origin, fullCommand)) tracked = true;
       } else if (event.toolName === "bash") {
         const parts = fullCommand.split("|").map(s => s.trim());
         for (const part of parts) {
@@ -651,24 +714,9 @@ export default function readTracker(pi: ExtensionAPI): void {
               const p = arg.replace(/^['"]|['"]$/g, "");
               // If it looks like a URL, store as a resource — no path resolution
               if (/^https?:\/\//i.test(p)) {
-                const now = Date.now();
-                const existing = fileMap.get(p);
-                if (existing) {
-                  existing.readCount++;
-                  existing.lastRead = now;
-                } else {
-                  fileMap.set(p, {
-                    path: p,
-                    type: "resource",
-                    readCount: 1,
-                    external: true,
-                    verified: false,
-                    lastRead: now,
-                    questionable: isQuestionable,
-                  });
-                }
+                trackUrlResource(p, isQuestionable, origin, fullCommand);
                 tracked = true;
-              } else if (trackReadCandidate(p, isQuestionable)) {
+              } else if (trackReadCandidate(p, isQuestionable, origin, fullCommand)) {
                 tracked = true;
               }
             }
@@ -686,16 +734,20 @@ export default function readTracker(pi: ExtensionAPI): void {
   // ── Commands ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("read-tracker", {
-    description: "Toggle read-files widget  |  args: clear | all | limit <N>",
+    description: "Toggle read-files widget  |  args: clear | all | limit <N> | audit",
     handler: async (args, ctx) => {
-      const arg = (args || "").trim().toLowerCase();
+      const fullInput = (args || "").trim();
+      const arg = fullInput.toLowerCase();
+
       if (arg === "clear") {
         fileMap.clear();
+        commandAuditLog.clear();
         persistState();
         updateWidget(ctx);
         ctx.ui.notify("Read tracker: cleared", "info");
         return;
       }
+
       if (arg === "all") {
         showAll = !showAll;
         persistState();
@@ -708,6 +760,7 @@ export default function readTracker(pi: ExtensionAPI): void {
         );
         return;
       }
+
       if (arg.startsWith("limit ")) {
         const n = parseInt(arg.slice(6), 10);
         if (!isNaN(n) && n > 0) {
@@ -721,6 +774,80 @@ export default function readTracker(pi: ExtensionAPI): void {
         }
         return;
       }
+
+      if (arg === "audit") {
+        // Gather tracked files sorted by recency (same order as the widget)
+        const files = [...fileMap.values()];
+        if (files.length === 0) {
+          ctx.ui.notify("No tracked files to audit", "warning");
+          return;
+        }
+        files.sort((a, b) => (b.lastRead ?? 0) - (a.lastRead ?? 0));
+
+        // Present an interactive picker — select() takes string[] only
+        const choices = files.map((f, i) => {
+          const name = f.type === "resource" ? f.path : basename(f.path);
+          const icon = f.type === "resource" ? "🌐" : f.questionable ? "❓" : "📄";
+          return `${i + 1}. ${name}  ${icon}  ${f.readCount} read${f.readCount !== 1 ? "s" : ""}`;
+        });
+        const picked = await ctx.ui.select("Select a file to audit:", choices);
+        if (!picked) return; // user cancelled
+
+        // The label starts with "N. " — extract the index from the choice
+        const idxMatch = picked.match(/^(\d+)\./);
+        const targetFile = idxMatch ? files[parseInt(idxMatch[1], 10) - 1] : undefined;
+        if (!targetFile) {
+          ctx.ui.notify("Could not resolve selected file", "warning");
+          return;
+        }
+
+        // Look up audit entries for this file
+        const auditEntries = commandAuditLog.get(targetFile.path) ?? [];
+        const label = targetFile.type === "resource" ? targetFile.path : basename(targetFile.path);
+
+        // Build output
+        const lines: string[] = [];
+        lines.push(`Audit: ${label}`);
+        lines.push(`  Path: ${targetFile.path}`);
+        lines.push(`  Reads: ${targetFile.readCount}  |  Commands: ${auditEntries.length}`);
+        lines.push("");
+
+        // Most recent first, times right-justified so icons align
+        for (const entry of auditEntries.slice().reverse()) {
+          const rel = relativeTime(entry.timestamp).padStart(8);
+          const icon = entry.origin === "bash" ? "❯" : "$";
+          lines.push(`  ${rel}  ${icon} ${entry.fullCommand}`);
+        }
+
+        // Persist in session stream
+        pi.appendEntry("read-tracker-audit", {
+          file: targetFile.path,
+          label,
+          readCount: targetFile.readCount,
+          invocations: auditEntries.slice().reverse().map(e => ({
+            timestamp: e.timestamp,
+            relative: relativeTime(e.timestamp),
+            origin: e.origin,
+            fullCommand: e.fullCommand,
+          })),
+          queriedAt: new Date().toISOString(),
+        });
+
+        // Show result
+        if (auditEntries.length === 0) {
+          ctx.ui.notify(`No recorded commands interacted with "${label}"`, "info");
+        } else {
+          ctx.ui.notify(`Audit for "${label}" — ${auditEntries.length} invocation(s)`, "info");
+          // Display the detailed audit in the conversation
+          pi.sendMessage({
+            customType: "read-tracker-audit",
+            content: lines.join("\n"),
+            display: true,
+          });
+        }
+        return;
+      }
+
       widgetEnabled = !widgetEnabled;
       persistState();
       updateWidget(ctx);

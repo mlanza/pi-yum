@@ -34,6 +34,7 @@ Omit the flag (default) for zero logging overhead.
 | `/read-tracker clear` | Clear the tracked read-files list         |
 | `/read-tracker all` | Toggle show-all mode to reveal every tracked file |
 | `/read-tracker limit <N>` | Set the visible-file limit (default: `8`) and exit show-all mode |
+| `/read-tracker audit` | Show every recorded command that caused a file to be tracked as a read. Picks the file via an interactive TUI selector. |
 
 ## Behavior
 
@@ -47,6 +48,34 @@ Omit the flag (default) for zero logging overhead.
 - Commands that only sniff the tree (for example `rg -n …`) are treated as questionable reads: the entry still counts, but the left gutter switches to a ❓ and the internal flag remembers the inference came from a heuristic scan.
 - The widget only renders the most recent `8` reads by default. When older entries are hidden the header switches to `Read files (visible/total)` and a dim footer highlights `… N older files hidden · /read-tracker all`.
 - Use `/read-tracker all` to toggle showing every tracked file, and `/read-tracker limit <N>` to raise the visible-file cap and exit show-all mode.
+
+## `/read-tracker audit` — Trace the Decision Pipeline
+
+The audit subcommand traces backward through the data pipeline to answer **why** a particular file appears in the read-tracker widget. It shows every raw invocation (tool call or bash command) that — when processed through the whatsop normalization library or the fallback heuristic — caused that file to be registered as a read.
+
+**How it works:**
+
+1. **Identify the target** — `/read-tracker audit` opens an interactive TUI selector listing every tracked file sorted by recency. Each entry shows the filename (or URL for network resources), a type icon (`📄` / `🌐` / `❓`), and the read count. The user picks one (or presses Esc to cancel).
+2. **Look up the audit trail** — the extension maintains an in-memory `commandAuditLog` map (`filePath → AuditEntry[]`). Every time `tool_result` successfully tracks a file as a read, it records the originating `fullCommand` + `origin` (`"bash"` or `"tool-call"`) + a millisecond timestamp into this map.
+3. **Format the output** — each matching invocation is displayed with a relative timestamp (e.g., `15m ago`, `2h ago`, `1d ago`), an origin icon (`❯` for bash, `$` for tool-calls), and the full command string.
+4. **Persist in the session stream** — the audit log is stored alongside the tracked file stats in the `PersistedState.auditLog` field, so the full command history survives session restarts and branch navigation.
+
+**Design rationale:**
+
+- The audit log is recorded at the same point where the read decision is made — inside `tool_result`, right after `accumulateRead`, `trackUrlResource`, or `trackReadCandidate` confirms that a file qualifies as a read. This gives a faithful backward trace from the UI entry to the original raw command.
+- It does **not** depend on the optional `--read-tracker-log` JSONL file. The entire audit trail lives in memory and in the session stream, consistent with the extension's FP idiom of starting with data (the raw invocations) and transforming it through the library to produce enriched perspectives (the read widget and the audit trail).
+- The `auditLog` is serialized into the same `pi.appendEntry("read-tracker", …)` entry that stores the file stats, so it's atomically persisted and restored together with the widget state.
+
+**Example output (as seen in the conversation):**
+
+```
+Audit: extensions.md
+  Path: /home/user/project/docs/extensions.md
+  Reads: 3  |  Commands: 2
+
+  15m ago  ❯ cat extensions.md
+  2m ago   ❯ grep -n "audit" extensions.md
+```
 
 ## Design notes
 
