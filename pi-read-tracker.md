@@ -56,8 +56,8 @@ The audit subcommand traces backward through the data pipeline to answer **why**
 **How it works:**
 
 1. **Identify the target** — `/read-tracker audit` opens an interactive TUI selector listing every tracked file sorted by recency. Each entry shows the filename (or URL for network resources), a type icon (`📄` / `🌐` / `❓`), and the read count. The user picks one (or presses Esc to cancel).
-2. **Look up the audit trail** — the extension maintains an in-memory `commandAuditLog` map (`filePath → AuditEntry[]`). Every time `tool_result` successfully tracks a file as a read, it records the originating `fullCommand` + `origin` (`"bash"` or `"tool-call"`) + a millisecond timestamp into this map.
-3. **Format the output** — each matching invocation is displayed with a relative timestamp (e.g., `15m ago`, `2h ago`, `1d ago`), an origin icon (`❯` for bash, `$` for tool-calls), and the full command string.
+2. **Look up the audit trail** — the extension maintains an in-memory `commandAuditLog` map (`filePath → AuditEntry[]`). Every time `tool_result` successfully tracks a file as a read, it records the originating `fullCommand` + `origin` (`"bash"` or `"tool-call"`) + a millisecond timestamp + the unique `toolCallId` into this map.
+3. **Format the output** — each matching invocation is displayed with a relative timestamp (e.g., `15m ago`, `2h ago`, `1d ago`), the tool-call ID (groups all files touched by the same compound command), an origin icon (`❯` for bash, `$` for tool-calls), and the full command string. Files touched by the same compound command share the same `toolCallId`, making it easy to see which files were read together (e.g. `cat a.txt b.txt` produces one audit entry per file, both showing `call_abc123`).
 4. **Persist in the session stream** — the audit log is stored alongside the tracked file stats in the `PersistedState.auditLog` field, so the full command history survives session restarts and branch navigation.
 
 **Design rationale:**
@@ -65,6 +65,23 @@ The audit subcommand traces backward through the data pipeline to answer **why**
 - The audit log is recorded at the same point where the read decision is made — inside `tool_result`, right after `accumulateRead`, `trackUrlResource`, or `trackReadCandidate` confirms that a file qualifies as a read. This gives a faithful backward trace from the UI entry to the original raw command.
 - It does **not** depend on the optional `--read-tracker-log` JSONL file. The entire audit trail lives in memory and in the session stream, consistent with the extension's FP idiom of starting with data (the raw invocations) and transforming it through the library to produce enriched perspectives (the read widget and the audit trail).
 - The `auditLog` is serialized into the same `pi.appendEntry("read-tracker", …)` entry that stores the file stats, so it's atomically persisted and restored together with the widget state.
+- **Reads == Commands.** A single command invocation counts as at most **+1 read per file**, regardless of how many subcommands, pipe segments, or argument mentions reference that file within the same invocation. The read count therefore represents *how many distinct commands* have read/accessed the file, not how many times the file name was parsed. The audit log (`commandAuditLog`) is the authoritative source for this count; on session restore the persisted `readCount` is reconciled to `auditLog.length` when an audit trail exists for the file.
+- **One command → many files.** A single compound command (e.g. `cat a.txt b.txt`, `grep -n "pattern" file1.ts file2.ts`) can cause **multiple files** to be tracked simultaneously. Each file gets its own audit entry — all sharing the same `fullCommand` — because the read count for each file increments independently. The dedup set ensures that within a single invocation the same file is never counted twice, but different files in the same command each get their own +1. This means the audit log for a compound command will contain N entries (one per distinct file), all with the same command string.
+- **Session reconstruction (audit log rebuilt from session stream).** When restoring a past session whose `PersistedState` has no `auditLog` field (e.g. sessions created before the audit feature was deployed, or sessions where the field was never persisted), the extension walks the session branch entries and re-runs the same file-discovery logic — whatsop normalization + fallback heuristics — against each historical `tool_result` / `bashExecution` entry. The discovered files are recorded into `commandAuditLog` via `recordAudit()` using the historical timestamp from the session entry, so the audit trail faithfully represents when each command ran. After reconstruction, every file's `readCount` is reconciled to `auditLog.length` to guarantee reads == commands. This makes the audit fully self-contained within the session stream with no forward-recording dependency — the session IS the data source.
+
+  **Reconstruction logic (FP chain):**
+
+  ```
+  session entries
+    → filter assistant messages, extract ToolCall blocks (toolCallId → {toolName, args, timestamp})
+    → filter toolResult / bashExecution messages
+    → for each successful result: reconstruct origin + fullCommand
+    → for each command: run discoverTrackedFiles() (shared logic)
+    → for each discovered file: recordAudit(filePath, origin, fullCommand, historicalTimestamp)
+    → reconcile readCount = auditLog.length for every file
+  ```
+
+  The same `discoverTrackedFiles()` function that powers the live `tool_result` handler is reused during reconstruction, ensuring exact parity between forward-recorded and reconstructed audit trails.
 
 **Example output (as seen in the conversation):**
 
@@ -73,9 +90,11 @@ Audit: extensions.md
   Path: /home/user/project/docs/extensions.md
   Reads: 3  |  Commands: 2
 
-  15m ago  ❯ cat extensions.md
-  2m ago   ❯ grep -n "audit" extensions.md
+  15m ago call_abc123  ❯ cat a.txt b.txt
+  2m ago  call_def456  ❯ grep -n "audit" extensions.md
 ```
+
+Note that compound commands appear identically across files they touched — auditing `a.txt` and `b.txt` would both show the same `call_abc123` entry.
 
 ## Design notes
 

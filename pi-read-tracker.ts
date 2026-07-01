@@ -17,7 +17,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { appendFileSync, existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -61,6 +61,8 @@ interface AuditEntry {
   origin: string;
   /** The full raw command string */
   fullCommand: string;
+  /** Unique tool-call identifier (groups all files touched by the same command) */
+  toolCallId?: string;
 }
 
 /** Map from file path → audit entries for every command that touched it */
@@ -68,14 +70,35 @@ const commandAuditLog = new Map<string, AuditEntry[]>();
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function recordAudit(filePath: string, origin: string, fullCommand: string): void {
-  const entry: AuditEntry = { timestamp: Date.now(), origin, fullCommand };
+function recordAudit(filePath: string, origin: string, fullCommand: string, timestamp?: number, toolCallId?: string): void {
+  const entry: AuditEntry = { timestamp: timestamp ?? Date.now(), origin, fullCommand, toolCallId };
   const entries = commandAuditLog.get(filePath);
   if (entries) {
     entries.push(entry);
   } else {
     commandAuditLog.set(filePath, [entry]);
   }
+}
+
+interface DiscoveredFile {
+  absPath: string;
+  type: ReadType;
+  external: boolean;
+  verified: boolean;
+  questionable: boolean;
+}
+
+/**
+ * Deterministic short hash from a string, truncated to `len` characters.
+ * Uses a simple DJB2-style hash for speed and cross-platform consistency.
+ */
+function shortHash(text: string, len: number): string {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  }
+  // Convert to positive hex string and truncate
+  return (Math.abs(hash) >>> 0).toString(36).slice(0, len).padStart(len, "0");
 }
 
 function relativeTime(ts: number): string {
@@ -180,6 +203,14 @@ export default function readTracker(pi: ExtensionAPI): void {
   // Capture bash commands for read inference
   const pendingBashCommands = new Map<string, string>();
 
+  // ─── Message renderer for audit output ───────────────────────────────────
+  pi.registerMessageRenderer("read-tracker-audit", (message, _options, theme) => {
+    let text = typeof message.content === "string" ? message.content : "";
+    // Replace \x01…\x02 markers with dim-styled short hash
+    text = text.replace(/\x01(.+?)\x02/g, (_, hash) => theme.fg("dim", hash));
+    return new Text(text, 0, 0);
+  });
+
   // ─── CLI flag: JSONL session logging ─────────────────────────────────────
   pi.registerFlag("read-tracker-log", {
     description: "Enable JSONL invocation logging to <session-id>.jsonl",
@@ -282,7 +313,7 @@ export default function readTracker(pi: ExtensionAPI): void {
     } satisfies PersistedState);
   }
 
-  function restoreFromSession(ctx: ExtensionContext): void {
+  async function restoreFromSession(ctx: ExtensionContext): Promise<void> {
     fileMap.clear();
     fileMemo.clear();
     commandAuditLog.clear();
@@ -309,12 +340,18 @@ export default function readTracker(pi: ExtensionAPI): void {
         // from the pre-location era where User-Agent strings were classified as
         // filesystem paths (e.g. "Mozilla/5.0 (Windows NT...)").
         if (typeof f.path === "string" && /[()]/.test(f.path)) continue;
+
+        // If we have an audit trail for this file, reconcile readCount to match
+        // (each distinct command is one read — no double-counting)
+        const auditLog = commandAuditLog.get(f.path);
+        const reconciledCount = auditLog ? auditLog.length : (typeof f.readCount === "number" ? f.readCount : 1);
+
         if (readType === "resource") {
           // Resources stored as-is — no filesystem validation
           fileMap.set(f.path, {
             path: f.path,
             type: "resource",
-            readCount: typeof f.readCount === "number" ? f.readCount : 0,
+            readCount: reconciledCount,
             external: true,
             verified: false,
             lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
@@ -326,7 +363,7 @@ export default function readTracker(pi: ExtensionAPI): void {
           const normalized: FileReadStats = {
             path: resolved.path,
             type: "file",
-            readCount: typeof f.readCount === "number" ? f.readCount : 0,
+            readCount: reconciledCount,
             external: isExternalPath(resolved.path, cwd),
             verified: Boolean(f.verified) || resolved.verified,
             lastRead: typeof f.lastRead === "number" ? f.lastRead : 0,
@@ -336,6 +373,32 @@ export default function readTracker(pi: ExtensionAPI): void {
           // Seed the file memo from verified paths
           if (normalized.verified) fileMemo.add(normalized.path);
         }
+      }
+    }
+
+    // Reconstruct audit log from session entries when:
+    // - No audit log was persisted (pre-audit sessions), OR
+    // - The persisted entries lack toolCallId (pre-toolCallId sessions).
+    const needsReconstruction =
+      commandAuditLog.size === 0 ||
+      (() => {
+        for (const entries of commandAuditLog.values()) {
+          for (const e of entries) {
+            if (!e.toolCallId) return true;
+          }
+        }
+        return false;
+      })();
+
+    if (needsReconstruction && entries.length > 0) {
+      commandAuditLog.clear();
+      await _loadWhatsop();
+      await reconstructAuditFromSession(entries);
+
+      // Reconcile readCount: reads == commands
+      for (const fStats of fileMap.values()) {
+        const al = commandAuditLog.get(fStats.path);
+        if (al) fStats.readCount = al.length;
       }
     }
   }
@@ -469,9 +532,13 @@ export default function readTracker(pi: ExtensionAPI): void {
     questionable = false,
     auditOrigin?: string,
     auditCommand?: string,
+    dedupSet?: Set<string>,
+    toolCallId?: string,
   ): void {
-    // Reject parenthesized paths — they are garbage from old UA-string false positives
+    // Skip if already counted in this invocation (dedup within a single command)
     if (/[()]/.test(absPath)) return;
+    if (dedupSet?.has(absPath)) return;
+    dedupSet?.add(absPath);
     const now = Date.now();
     const existing = fileMap.get(absPath);
     if (existing) {
@@ -492,7 +559,7 @@ export default function readTracker(pi: ExtensionAPI): void {
       });
     }
     if (auditOrigin && auditCommand) {
-      recordAudit(absPath, auditOrigin, auditCommand);
+      recordAudit(absPath, auditOrigin, auditCommand, undefined, toolCallId);
     }
   }
 
@@ -501,15 +568,19 @@ export default function readTracker(pi: ExtensionAPI): void {
     questionable = false,
     auditOrigin?: string,
     auditCommand?: string,
+    dedupSet?: Set<string>,
   ): boolean {
     const resolved = resolveFileCandidate(candidate, cwd);
     if (!resolved) return false;
     const external = isExternalPath(resolved.path, cwd);
-    accumulateRead(resolved.path, external, resolved.verified, questionable, auditOrigin, auditCommand);
+    accumulateRead(resolved.path, external, resolved.verified, questionable, auditOrigin, auditCommand, dedupSet);
     return true;
   }
 
-  function trackUrlResource(url: string, questionable: boolean, auditOrigin?: string, auditCommand?: string): void {
+  function trackUrlResource(url: string, questionable: boolean, auditOrigin?: string, auditCommand?: string, dedupSet?: Set<string>, toolCallId?: string): void {
+    // Skip if already counted in this invocation (dedup within a single command)
+    if (dedupSet?.has(url)) return;
+    dedupSet?.add(url);
     const now = Date.now();
     const existing = fileMap.get(url);
     if (existing) {
@@ -527,7 +598,264 @@ export default function readTracker(pi: ExtensionAPI): void {
       });
     }
     if (auditOrigin && auditCommand) {
-      recordAudit(url, auditOrigin, auditCommand);
+      recordAudit(url, auditOrigin, auditCommand, undefined, toolCallId);
+    }
+  }
+
+  /**
+   * Shared file-discovery logic — used both by the live tool_result handler and
+   * by audit reconstruction during session restore.  Runs whatsop normalisation
+   * (if available) then falls back to manual heuristics, returning the set of
+   * files that would be tracked for this invocation.  Does NOT mutate fileMap
+   * or commandAuditLog — that is the caller's responsibility.
+   */
+  async function discoverTrackedFiles(
+    origin: "bash" | "tool-call",
+    fullCommand: string,
+    toolName: string,
+    input: Record<string, any> | undefined,
+  ): Promise<DiscoveredFile[]> {
+    const files: DiscoveredFile[] = [];
+    const dedupSet = new Set<string>();
+    let trackedByWhatsop = false;
+
+    // ── Try whatsop-based tracking ────────────────────────────────────────
+    try {
+      const normalize = await _loadWhatsop();
+      if (normalize) {
+        const result = await normalize(
+          { origin, fullCommand },
+          { cwd, dataCallback: _dataCallback, fileMemo },
+        );
+
+        // Feed the memo (same as live code — harmless during replay since the
+        // set is already seeded from restored PersistedState).
+        for (const sub of result.subcommands ?? []) {
+          for (const arg of sub.args ?? []) {
+            if (arg.type === "resource" && arg.location && arg.questionable === 0 && !/^https?:\/\//i.test(arg.location)) {
+              fileMemo.add(arg.location);
+            }
+            if (arg.type === "data" && arg.expanded) {
+              for (const ea of arg.expanded) {
+                if (ea.type === "resource" && ea.location && ea.questionable === 0 && !/^https?:\/\//i.test(ea.location)) {
+                  fileMemo.add(ea.location);
+                }
+              }
+            }
+          }
+        }
+
+        for (const sub of result.subcommands ?? []) {
+          // For tool-call origins, only track the "read" tool
+          if (origin === "tool-call" && toolName !== "read") continue;
+          // For bash origins, only track known read commands
+          if (origin === "bash") {
+            const actorBase = basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, "");
+            if (!READ_COMMANDS.has(actorBase) && !QUESTIONABLE_READ_COMMANDS.has(actorBase)) continue;
+          }
+
+          const isQuestionable =
+            origin === "bash" &&
+            sub.actor &&
+            QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, ""));
+
+          for (const arg of sub.args ?? []) {
+            if (arg.type === "resource" && arg.location) {
+              if (/^https?:\/\//i.test(arg.location)) {
+                if (dedupSet.has(arg.location)) continue;
+                dedupSet.add(arg.location);
+                files.push({ absPath: arg.location, type: "resource", external: true, verified: false, questionable: isQuestionable || arg.questionable === 1 });
+                trackedByWhatsop = true;
+              } else {
+                const resolved = resolveFileCandidate(arg.location, cwd);
+                if (resolved && !dedupSet.has(resolved.path)) {
+                  dedupSet.add(resolved.path);
+                  files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || arg.questionable === 1 });
+                  trackedByWhatsop = true;
+                }
+              }
+            }
+            if (arg.type === "data" && arg.expanded && arg.expanded.length > 0) {
+              for (const ea of arg.expanded) {
+                if (ea.type === "resource" && ea.location) {
+                  if (/^https?:\/\//i.test(ea.location)) {
+                    if (dedupSet.has(ea.location)) continue;
+                    dedupSet.add(ea.location);
+                    files.push({ absPath: ea.location, type: "resource", external: true, verified: false, questionable: isQuestionable || ea.questionable === 1 });
+                    trackedByWhatsop = true;
+                  } else {
+                    const resolved = resolveFileCandidate(ea.location, cwd);
+                    if (resolved && !dedupSet.has(resolved.path)) {
+                      dedupSet.add(resolved.path);
+                      files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified || existsSync(resolved.path), questionable: isQuestionable || ea.questionable === 1 });
+                      trackedByWhatsop = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // whatsop failed; fall through to manual tracking
+    }
+
+    // ── Fallback manual tracking ──────────────────────────────────────────
+    if (!trackedByWhatsop) {
+      if (toolName === "read" && input?.path) {
+        const resolved = resolveFileCandidate(input.path, cwd);
+        if (resolved && !dedupSet.has(resolved.path)) {
+          dedupSet.add(resolved.path);
+          files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified, questionable: false });
+        }
+      } else if (toolName === "bash" && fullCommand) {
+        const parts = fullCommand.split("|").map(s => s.trim());
+        for (const part of parts) {
+          const tokens = part.split(/\s+/);
+          const [bin, ...args] = tokens;
+          const base = bin.includes("/") ? bin.slice(bin.lastIndexOf("/") + 1) : bin;
+          const shouldTrack = READ_COMMANDS.has(base) || QUESTIONABLE_READ_COMMANDS.has(base);
+          if (!shouldTrack) continue;
+          const isQuestionable = QUESTIONABLE_READ_COMMANDS.has(base);
+          for (const arg of args) {
+            if (!arg.startsWith("-") && !arg.includes("=")) {
+              const p = arg.replace(/^['"]|['"]$/g, "");
+              if (/^https?:\/\//i.test(p)) {
+                if (dedupSet.has(p)) continue;
+                dedupSet.add(p);
+                files.push({ absPath: p, type: "resource", external: true, verified: false, questionable: isQuestionable });
+              } else {
+                const resolved = resolveFileCandidate(p, cwd);
+                if (resolved && !dedupSet.has(resolved.path)) {
+                  dedupSet.add(resolved.path);
+                  files.push({ absPath: resolved.path, type: "file", external: isExternalPath(resolved.path, cwd), verified: resolved.verified, questionable: isQuestionable });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return files;
+  }
+
+  /** Extract a Unix-ms timestamp from a session entry (message or entry-level). */
+  function entryTimestamp(entry: any, msg: any): number {
+    if (typeof msg?.timestamp === "number") return msg.timestamp;
+    if (typeof entry.timestamp === "string") return Date.parse(entry.timestamp);
+    return Date.now();
+  }
+
+  /**
+   * Rebuild commandAuditLog by replaying every successful tool_result / bashExecution
+   * entry in the session branch through discoverTrackedFiles().  Only called when
+   * the PersistedState had no auditLog field (e.g. past sessions created before the
+   * audit feature existed).
+   */
+  async function reconstructAuditFromSession(entries: any[]): Promise<void> {
+    // First pass: collect ToolCall blocks from assistant messages.
+    // toolCallId → { toolName, args, timestamp }
+    const toolCallMap = new Map<string, { toolName: string; args: Record<string, any>; timestamp: number }>();
+    for (const entry of entries) {
+      if (entry.type !== "message") continue;
+      const msg = (entry as any).message;
+      if (!msg || msg.role !== "assistant") continue;
+      if (!Array.isArray(msg.content)) continue;
+      const ts = entryTimestamp(entry, msg);
+      for (const block of msg.content) {
+        if (block?.type === "toolCall" && block.id) {
+          toolCallMap.set(block.id, {
+            toolName: block.name || "",
+            args: (block.arguments as Record<string, any>) ?? {},
+            timestamp: ts,
+          });
+        }
+      }
+    }
+
+    // Second pass: process every successful result.
+    // Track which toolCallIds we've already handled so BashExecutionMessage
+    // entries that duplicate a ToolResultMessage are skipped.
+    const handledToolCallIds = new Set<string>();
+
+    for (const entry of entries) {
+      if (entry.type !== "message") continue;
+      const msg = (entry as any).message;
+      if (!msg) continue;
+
+      let origin: "bash" | "tool-call" | undefined;
+      let fullCommand: string | undefined;
+      let toolName: string | undefined;
+      let input: Record<string, any> | undefined;
+      let timestamp: number;
+      let toolCallId: string | undefined;
+
+      if (msg.role === "toolResult" && !msg.isError) {
+        const tc = toolCallMap.get(msg.toolCallId);
+        if (!tc) continue;
+        timestamp = tc.timestamp;
+        toolName = msg.toolName || tc.toolName;
+        input = tc.args;
+        toolCallId = msg.toolCallId;
+        if (toolName === "bash") {
+          const cmd = typeof tc.args.command === "string" ? tc.args.command : "";
+          origin = "bash";
+          fullCommand = cmd;
+        } else {
+          origin = "tool-call";
+          fullCommand = `${toolName} ${JSON.stringify(input)}`;
+        }
+        handledToolCallIds.add(toolCallId);
+      } else if (msg.role === "bashExecution" && !msg.cancelled) {
+        // BashExecutionMessage may duplicate a ToolResultMessage — try to
+        // resolve its command back to a ToolCall entry to reuse the ID and
+        // skip if already handled.
+        const cmd = msg.command || "";
+        // Look for a bash ToolCall whose args.command matches this command
+        let matched = false;
+        for (const [tcId, tc] of toolCallMap) {
+          if (tc.toolName === "bash" && tc.args.command === cmd) {
+            if (handledToolCallIds.has(tcId)) {
+              matched = true; // already handled via ToolResultMessage — skip
+            } else {
+              // Standalone BashExecutionMessage — use the resolved ToolCall
+              origin = "bash";
+              fullCommand = cmd;
+              toolName = "bash";
+              input = { command: cmd };
+              timestamp = tc.timestamp;
+              toolCallId = tcId;
+              handledToolCallIds.add(tcId);
+              matched = true;
+            }
+            break;
+          }
+        }
+        if (matched) {
+          // Proceed to record audit below (or skip for already-handled case)
+          if (!origin) continue; // was already handled, skip
+        } else {
+          // No corresponding ToolCall found in the session — process as-is
+          origin = "bash";
+          fullCommand = cmd;
+          toolName = "bash";
+          input = { command: cmd };
+          timestamp = entryTimestamp(entry, msg);
+          // No toolCallId available
+        }
+      } else {
+        continue;
+      }
+
+      if (!origin || !fullCommand || !toolName) continue;
+
+      // Replay tracking — pure discovery, no fileMap mutation
+      const discovered = await discoverTrackedFiles(origin, fullCommand, toolName, input);
+      for (const f of discovered) {
+        recordAudit(f.absPath, origin, fullCommand, timestamp, toolCallId);
+      }
     }
   }
 
@@ -536,7 +864,7 @@ export default function readTracker(pi: ExtensionAPI): void {
   pi.on("session_start", async (_evt, ctx) => {
     cwd = ctx.cwd;
     loggingEnabled = pi.getFlag("read-tracker-log") === true;
-    restoreFromSession(ctx);
+    await restoreFromSession(ctx);
     await _loadWhatsop();
     updateWidget(ctx);
 
@@ -551,7 +879,7 @@ export default function readTracker(pi: ExtensionAPI): void {
   pi.on("session_tree", async (_evt, ctx) => {
     cwd = ctx.cwd;
     loggingEnabled = pi.getFlag("read-tracker-log") === true;
-    restoreFromSession(ctx);
+    await restoreFromSession(ctx);
     await _loadWhatsop();
     updateWidget(ctx);
 
@@ -596,136 +924,22 @@ export default function readTracker(pi: ExtensionAPI): void {
 
     if (!fullCommand) return;
 
-    // ── Try whatsop-based tracking ────────────────────────────────────────
-    let tracked = false;
+    // Use shared discovery logic (whatsop + fallback)
+    const discovered = await discoverTrackedFiles(
+      origin,
+      fullCommand,
+      event.toolName,
+      event.input as Record<string, any>,
+    );
 
-    try {
-      const normalize = await _loadWhatsop();
-      if (normalize) {
-        const result = await normalize(
-          { origin, fullCommand },
-          { cwd, dataCallback: _dataCallback, fileMemo },
-        );
-
-        // Feed the memo: filesystem paths confirmed by this invocation become oracle knowledge.
-        // URLs are NOT added to the memo (the memo is filesystem-only).
-        for (const sub of result.subcommands ?? []) {
-          for (const arg of sub.args ?? []) {
-            if (arg.type === "resource" && arg.location && arg.questionable === 0 && !/^https?:\/\//i.test(arg.location)) {
-              fileMemo.add(arg.location);
-            }
-            if (arg.type === "data" && arg.expanded) {
-              for (const ea of arg.expanded) {
-                if (ea.type === "resource" && ea.location && ea.questionable === 0 && !/^https?:\/\//i.test(ea.location)) {
-                  fileMemo.add(ea.location);
-                }
-              }
-            }
-          }
-        }
-
-        for (const sub of result.subcommands ?? []) {
-          // For tool-call origins, only track the "read" tool
-          if (origin === "tool-call" && event.toolName !== "read") continue;
-          // For bash origins, only track known read commands.
-          // Strip .exe/.com/.bat/.cmd so resolved paths match the set keys on Windows.
-          if (origin === "bash") {
-            const actorBase = basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, "");
-            if (!READ_COMMANDS.has(actorBase) && !QUESTIONABLE_READ_COMMANDS.has(actorBase)) continue;
-          }
-
-          const isQuestionable =
-            origin === "bash" &&
-            sub.actor &&
-            QUESTIONABLE_READ_COMMANDS.has(basename(sub.actor).replace(/\.(exe|com|bat|cmd)$/i, ""));
-
-          for (const arg of sub.args ?? []) {
-            // Use the unified `location` field. For URL resources (http/https),
-            // store directly as a network resource without filesystem resolution.
-            // For filesystem paths, validate through resolveFileCandidate.
-            if (arg.type === "resource" && arg.location) {
-              if (/^https?:\/\//i.test(arg.location)) {
-                // Network resource (URL) — store directly
-                trackUrlResource(arg.location, isQuestionable || arg.questionable === 1, origin, fullCommand);
-                tracked = true;
-              } else {
-                // Filesystem path — validate through resolveFileCandidate
-                const resolved = resolveFileCandidate(arg.location, cwd);
-                if (resolved) {
-                  accumulateRead(
-                    resolved.path,
-                    isExternalPath(resolved.path, cwd),
-                    resolved.verified || existsSync(resolved.path),
-                    isQuestionable || arg.questionable === 1,
-                    origin,
-                    fullCommand,
-                  );
-                  tracked = true;
-                }
-              }
-            }
-            // Also process expanded nodes from dataCallback.
-            if (arg.type === "data" && arg.expanded && arg.expanded.length > 0) {
-              for (const expandedArg of arg.expanded) {
-                if (expandedArg.type === "resource" && expandedArg.location) {
-                  if (/^https?:\/\//i.test(expandedArg.location)) {
-                    // URL resource from data expansion
-                    trackUrlResource(expandedArg.location, isQuestionable || expandedArg.questionable === 1, origin, fullCommand);
-                    tracked = true;
-                  } else {
-                    const resolved = resolveFileCandidate(expandedArg.location, cwd);
-                    if (resolved) {
-                      accumulateRead(
-                        resolved.path,
-                        isExternalPath(resolved.path, cwd),
-                        resolved.verified || existsSync(resolved.path),
-                        isQuestionable || expandedArg.questionable === 1,
-                        origin,
-                        fullCommand,
-                      );
-                      tracked = true;
-                    }
-                  }
-                }
-              }
-            }
-          }
+    if (discovered.length > 0) {
+      for (const f of discovered) {
+        if (f.type === "resource") {
+          trackUrlResource(f.absPath, f.questionable, origin, fullCommand, undefined, event.toolCallId);
+        } else {
+          accumulateRead(f.absPath, f.external, f.verified, f.questionable, origin, fullCommand, undefined, event.toolCallId);
         }
       }
-    } catch {
-      // whatsop failed; fall through to manual tracking
-    }
-
-    // ── Fallback manual tracking ──────────────────────────────────────────
-    if (!tracked) {
-      if (event.toolName === "read") {
-        const input = event.input as { path: string };
-        if (trackReadCandidate(input.path, false, origin, fullCommand)) tracked = true;
-      } else if (event.toolName === "bash") {
-        const parts = fullCommand.split("|").map(s => s.trim());
-        for (const part of parts) {
-          const [bin, ...args] = part.split(/\s+/);
-          const base = bin.includes("/") ? bin.slice(bin.lastIndexOf("/") + 1) : bin;
-          const shouldTrack = READ_COMMANDS.has(base) || QUESTIONABLE_READ_COMMANDS.has(base);
-          if (!shouldTrack) continue;
-          const isQuestionable = QUESTIONABLE_READ_COMMANDS.has(base);
-          for (const arg of args) {
-            if (!arg.startsWith("-") && !arg.includes("=")) {
-              const p = arg.replace(/^['"]|['"]$/g, "");
-              // If it looks like a URL, store as a resource — no path resolution
-              if (/^https?:\/\//i.test(p)) {
-                trackUrlResource(p, isQuestionable, origin, fullCommand);
-                tracked = true;
-              } else if (trackReadCandidate(p, isQuestionable, origin, fullCommand)) {
-                tracked = true;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (tracked) {
       persistState();
       updateWidget(ctx);
     }
@@ -809,14 +1023,18 @@ export default function readTracker(pi: ExtensionAPI): void {
         const lines: string[] = [];
         lines.push(`Audit: ${label}`);
         lines.push(`  Path: ${targetFile.path}`);
-        lines.push(`  Reads: ${targetFile.readCount}  |  Commands: ${auditEntries.length}`);
+        lines.push(`  Reads: ${targetFile.readCount}`);
         lines.push("");
 
         // Most recent first, times right-justified so icons align
         for (const entry of auditEntries.slice().reverse()) {
           const rel = relativeTime(entry.timestamp).padStart(8);
           const icon = entry.origin === "bash" ? "❯" : "$";
-          lines.push(`  ${rel}  ${icon} ${entry.fullCommand}`);
+          // Short hash displayed in place of full toolCallId (dimmed by renderer)
+          const tcDisplay = entry.toolCallId
+            ? ` \x01${shortHash(entry.toolCallId, 5)}\x02`
+            : "";
+          lines.push(`  ${rel}${tcDisplay}  ${icon} ${entry.fullCommand}`);
         }
 
         // Persist in session stream
@@ -829,6 +1047,7 @@ export default function readTracker(pi: ExtensionAPI): void {
             relative: relativeTime(e.timestamp),
             origin: e.origin,
             fullCommand: e.fullCommand,
+            toolCallId: e.toolCallId,
           })),
           queriedAt: new Date().toISOString(),
         });
