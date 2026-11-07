@@ -13,6 +13,8 @@
  *   /web-tracker limit N   – set the visible-resource cap (default: 8)
  *   /web-approval ask|approve|deny – set untrusted URL handling mode
  *   /web-approval status           – show current approval mode
+ *   /web-approval list             – list trusted URL regex patterns
+ *   /web-render old|new            – switch URL rendering layout
  *
  * Placement: ~/.pi/agent/extensions/web-tracker/index.ts
  */
@@ -51,6 +53,38 @@ interface TrustedPatternParseResult {
   patterns: TrustedPattern[];
   invalid: string[];
   parseError?: string;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function deriveRootHost(hostname: string): string {
+  const host = hostname.trim().toLowerCase();
+  if (!host) return host;
+  if (host === "localhost") return host;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return host;
+  return host.replace(/^www\./, "");
+}
+
+function buildSessionTrustPatternFromUrl(candidateUrl: string): {
+  labelUrl: string;
+  rawRegex: string;
+} | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(candidateUrl);
+  } catch {
+    return undefined;
+  }
+
+  const rootHost = deriveRootHost(parsed.hostname);
+  if (!rootHost) return undefined;
+
+  const labelUrl = `${parsed.protocol}//${rootHost}`;
+  const escapedRoot = escapeRegExp(rootHost);
+  const rawRegex = `^https?:\\/\\/(?:[^\\/]+\\.)*${escapedRoot}(?::\\d+)?(?:\\/|$)`;
+  return { labelUrl, rawRegex };
 }
 
 function parseTrustedHostPatterns(value: string | undefined): TrustedPatternParseResult {
@@ -122,6 +156,8 @@ interface PersistedState {
   fileLimit?: number;
   showAll?: boolean;
   webApprovalMode?: WebApprovalMode;
+  webRenderLayout?: UrlLayout;
+  sessionTrustedHostPatterns?: string[];
 }
 
 interface ApprovalDecision {
@@ -133,6 +169,52 @@ interface ApprovalDecision {
 const DEFAULT_LIMIT = 8;
 const URL_IN_COMMAND_RX = /\bhttps?:\/\/[^\s"'`<>]+/gi;
 
+type UrlLayout = "old" | "new";
+const DEFAULT_URL_LAYOUT: UrlLayout = "new";
+
+type UrlPortionRenderer = (
+  resource: NetworkReadStats,
+  theme: {
+    fg: (slot: string, text: string) => string;
+    bold: (text: string) => string;
+  },
+  parts: {
+    gutter: string;
+    dimSep: string;
+  },
+) => string;
+
+const renderUrlPortionOld: UrlPortionRenderer = (resource, theme, { gutter, dimSep }) => {
+  const pathLabel = resource.path || "/";
+  const pathStr = theme.fg("accent", theme.bold(pathLabel));
+  const domainStr = theme.fg("dim", resource.domain);
+  return `${gutter}${dimSep}${pathStr}${dimSep}${domainStr}`;
+};
+
+const renderUrlPortionNew: UrlPortionRenderer = (resource, theme, { gutter }) => {
+  const pathLabel = resource.path || "/";
+  const pathStr = theme.fg("accent", theme.bold(pathLabel));
+  const domainStr = theme.fg("dim", resource.domain);
+  return `${gutter}${domainStr}${pathStr}`;
+};
+
+function makeUrlPortionRenderer(currentLayout: UrlLayout): UrlPortionRenderer {
+  return currentLayout === "old" ? renderUrlPortionOld : renderUrlPortionNew;
+}
+
+type CanonicalToolName = "web_fetch" | "open_links" | "bash" | "read" | "other";
+
+function canonicalizeToolName(toolName: string): CanonicalToolName {
+  const raw = (toolName || "").trim().toLowerCase();
+  const stripped = raw.startsWith("functions.") ? raw.slice("functions.".length) : raw;
+
+  if (stripped === "web_fetch" || stripped === "webfetch") return "web_fetch";
+  if (stripped === "open_links") return "open_links";
+  if (stripped === "bash") return "bash";
+  if (stripped === "read") return "read";
+  return "other";
+}
+
 function extractHttpUrls(text: string): string[] {
   const matches = text.match(URL_IN_COMMAND_RX) ?? [];
   const deduped = new Set<string>();
@@ -143,6 +225,27 @@ function extractHttpUrls(text: string): string[] {
     if (cleaned) deduped.add(cleaned);
   }
   return [...deduped];
+}
+
+function collectStringLeaves(value: unknown, out: Set<string>, seen = new WeakSet<object>()): void {
+  if (typeof value === "string") {
+    out.add(value);
+    return;
+  }
+
+  if (!value || typeof value !== "object") return;
+  if (seen.has(value)) return;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const entry of value) collectStringLeaves(entry, out, seen);
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const entry of Object.values(record)) {
+    collectStringLeaves(entry, out, seen);
+  }
 }
 
 function resolveNetworkResource(
@@ -182,11 +285,11 @@ export default function webTracker(pi: ExtensionAPI): void {
   const resourceMap = new Map<string, NetworkReadStats>();
   const pendingWebfetchUrls = new Map<string, string>();
   const pendingBashCommands = new Map<string, string>();
-  const {
-    patterns: trustedHostPatterns,
-    invalid: invalidTrustedHostPatterns,
-    parseError: trustedHostPatternParseError,
-  } = parseTrustedHostPatterns(process.env[TRUSTED_HOSTS_ENV]);
+  const trustedHostParseResult = parseTrustedHostPatterns(process.env[TRUSTED_HOSTS_ENV]);
+  const trustedHostPatterns = [...trustedHostParseResult.patterns];
+  const sessionTrustedHostPatterns: string[] = [];
+  const invalidTrustedHostPatterns = trustedHostParseResult.invalid;
+  const trustedHostPatternParseError = trustedHostParseResult.parseError;
   const envWebApprovalModeRaw = process.env[WEB_APPROVAL_MODE_ENV];
   const envWebApprovalModeParsed = parseWebApprovalMode(envWebApprovalModeRaw);
   const defaultWebApprovalMode: WebApprovalMode = envWebApprovalModeParsed ?? "deny";
@@ -197,6 +300,7 @@ export default function webTracker(pi: ExtensionAPI): void {
   let fileLimit = DEFAULT_LIMIT;
   let showAll = false;
   let webApprovalMode: WebApprovalMode = defaultWebApprovalMode;
+  let webRenderLayout: UrlLayout = DEFAULT_URL_LAYOUT;
 
   function persistState(): void {
     pi.appendEntry("web-tracker", {
@@ -205,6 +309,8 @@ export default function webTracker(pi: ExtensionAPI): void {
       fileLimit,
       showAll,
       webApprovalMode,
+      webRenderLayout,
+      sessionTrustedHostPatterns: [...sessionTrustedHostPatterns],
     } satisfies PersistedState);
   }
 
@@ -232,6 +338,35 @@ export default function webTracker(pi: ExtensionAPI): void {
           : persistedMode === "off"
             ? "approve"
             : defaultWebApprovalMode;
+    const persistedLayout = lastState.webRenderLayout;
+    webRenderLayout = persistedLayout === "old" || persistedLayout === "new"
+      ? persistedLayout
+      : DEFAULT_URL_LAYOUT;
+
+    sessionTrustedHostPatterns.length = 0;
+    const persistedSessionPatterns = Array.isArray(lastState.sessionTrustedHostPatterns)
+      ? lastState.sessionTrustedHostPatterns
+      : [];
+    const invalidSessionPatterns: string[] = [];
+    for (const rawPattern of persistedSessionPatterns) {
+      if (typeof rawPattern !== "string" || !rawPattern.trim()) continue;
+      const raw = rawPattern.trim();
+      try {
+        const rx = new RegExp(raw, "i");
+        const alreadyPresent = trustedHostPatterns.some(pattern => pattern.raw === raw);
+        if (!alreadyPresent) trustedHostPatterns.push({ raw, rx });
+        if (!sessionTrustedHostPatterns.includes(raw)) sessionTrustedHostPatterns.push(raw);
+      } catch {
+        invalidSessionPatterns.push(raw);
+      }
+    }
+    if (invalidSessionPatterns.length > 0 && ctx.hasUI) {
+      ctx.ui.notify(
+        `Web tracker: invalid persisted trusted-host regex ignored: ${invalidSessionPatterns.join(", ")}`,
+        "warning",
+      );
+    }
+
     for (const resource of lastState.resources ?? []) {
       const url = resource.url;
       if (!url) continue;
@@ -292,16 +427,12 @@ export default function webTracker(pi: ExtensionAPI): void {
           lines.push(truncateToWidth(`${borderLeft}${titleColored}${borderRight}`, width));
 
           const dimSep = theme.fg("dim", " | ");
+          const renderUrlPortion = makeUrlPortionRenderer(webRenderLayout);
           for (const resource of visibleResources) {
-            const pathLabel = resource.path || "/";
             const warningSlot = resource.trusted ? "  " : theme.fg("error", "⚠️");
             const globeSlot = "🌐";
             const gutter = `${warningSlot}${globeSlot} `;
-            const pathStr = theme.fg("accent", theme.bold(pathLabel));
-            const domainStr = resource.trusted
-              ? theme.fg("dim", resource.domain)
-              : theme.fg("warning", resource.domain);
-            const leftPart = `${gutter}${dimSep}${pathStr}${dimSep}${domainStr}`;
+            const leftPart = renderUrlPortion(resource, theme, { gutter, dimSep });
             const countStr = theme.fg("warning", `📖${resource.readCount.toString().padStart(3, " ")}`);
             const gap = Math.max(1, width - visibleWidth(leftPart) - visibleWidth(countStr));
             lines.push(truncateToWidth(`${leftPart}${" ".repeat(gap)}${countStr}`, width));
@@ -336,29 +467,46 @@ export default function webTracker(pi: ExtensionAPI): void {
   }
 
   function extractUrlsFromToolCall(toolName: string, input: unknown): string[] {
-    if (toolName === "webfetch") {
+    const canonicalTool = canonicalizeToolName(toolName);
+    const discovered = new Set<string>();
+
+    if (canonicalTool === "web_fetch") {
       const url = (input as { url?: unknown })?.url;
-      return typeof url === "string" ? [url] : [];
+      if (typeof url === "string") discovered.add(url);
     }
 
-    if (toolName === "open_links") {
+    if (canonicalTool === "open_links") {
       const urls = (input as { urls?: unknown })?.urls;
-      if (!Array.isArray(urls)) return [];
-      return urls.filter((entry): entry is string => typeof entry === "string");
+      if (Array.isArray(urls)) {
+        for (const url of urls) {
+          if (typeof url === "string") discovered.add(url);
+        }
+      }
     }
 
-    if (toolName === "bash") {
+    if (canonicalTool === "bash") {
       const command = (input as { command?: unknown })?.command;
-      if (typeof command !== "string") return [];
-      return extractHttpUrls(command);
+      if (typeof command === "string") {
+        for (const url of extractHttpUrls(command)) discovered.add(url);
+      }
     }
 
-    if (toolName === "read") {
+    if (canonicalTool === "read") {
       const path = (input as { path?: unknown })?.path;
-      return typeof path === "string" ? [path] : [];
+      if (typeof path === "string") discovered.add(path);
     }
 
-    return [];
+    // Generic fallback: inspect all string args for every tool call.
+    // This keeps approval coverage for newly-installed URL-bearing tools.
+    const stringLeaves = new Set<string>();
+    collectStringLeaves(input, stringLeaves);
+    for (const leaf of stringLeaves) {
+      for (const url of extractHttpUrls(leaf)) {
+        discovered.add(url);
+      }
+    }
+
+    return [...discovered];
   }
 
   async function requestWebApproval(
@@ -396,6 +544,9 @@ export default function webTracker(pi: ExtensionAPI): void {
 
     const invocation = formatToolCall(toolName, input);
     const urlList = urls.map(url => `  • ${url}`).join("\n");
+
+    const addableTrust = buildSessionTrustPatternFromUrl(urls[0] ?? "");
+
     const message = [
       "Untrusted URL(s) detected:",
       urls.length > 0 ? urlList : "  • (none)",
@@ -403,10 +554,42 @@ export default function webTracker(pi: ExtensionAPI): void {
       "Full tool invocation:",
       invocation,
       "",
-      "Choose Yes to allow, No to block.",
+      addableTrust
+        ? `Choose Yes to allow, No to block, or Add (${addableTrust.labelUrl}) to trust for this session.`
+        : "Choose Yes to allow or No to block.",
     ].join("\n");
-    const approved = await ctx.ui.confirm("🌐 Web tracker · Approve call?", message);
-    if (approved) return { allow: true };
+
+    const addChoice = addableTrust ? `Add (${addableTrust.labelUrl})` : undefined;
+    const choices = addChoice ? ["Yes", "No", addChoice] : ["Yes", "No"];
+    const picked = await ctx.ui.select(`🌐 Web tracker · Approve call?\n\n${message}`, choices);
+
+    if (picked === "Yes") return { allow: true };
+
+    if (addChoice && picked === addChoice && addableTrust) {
+      const alreadyTrusted = trustedHostPatterns.some(pattern => {
+        try {
+          return pattern.rx.test(addableTrust.labelUrl) || pattern.rx.test(new URL(addableTrust.labelUrl).host);
+        } catch {
+          return false;
+        }
+      });
+      if (!alreadyTrusted) {
+        trustedHostPatterns.push({ raw: addableTrust.rawRegex, rx: new RegExp(addableTrust.rawRegex, "i") });
+      }
+      if (!sessionTrustedHostPatterns.includes(addableTrust.rawRegex)) {
+        sessionTrustedHostPatterns.push(addableTrust.rawRegex);
+      }
+
+      // Refresh trust badges for existing tracked resources immediately.
+      for (const resource of resourceMap.values()) {
+        resource.trusted = isTrustedUrl(resource.url, resource.host, trustedHostPatterns);
+      }
+      persistState();
+      updateWidget(ctx);
+
+      ctx.ui.notify(`Web tracker: trusted for this session: ${addableTrust.labelUrl}`, "info");
+      return { allow: true };
+    }
 
     return {
       allow: false,
@@ -497,7 +680,9 @@ export default function webTracker(pi: ExtensionAPI): void {
       }
     }
 
-    if (event.toolName === "webfetch") {
+    const canonicalTool = canonicalizeToolName(event.toolName);
+
+    if (canonicalTool === "web_fetch") {
       const input = event.input as { url?: string };
       if (input?.url) {
         pendingWebfetchUrls.set(event.toolCallId, input.url);
@@ -505,7 +690,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       return;
     }
 
-    if (event.toolName === "bash") {
+    if (canonicalTool === "bash") {
       const input = event.input as { command?: string };
       if (input?.command) {
         pendingBashCommands.set(event.toolCallId, input.command);
@@ -514,7 +699,9 @@ export default function webTracker(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName === "webfetch") {
+    const canonicalTool = canonicalizeToolName(event.toolName);
+
+    if (canonicalTool === "web_fetch") {
       const fallbackUrl = pendingWebfetchUrls.get(event.toolCallId);
       pendingWebfetchUrls.delete(event.toolCallId);
       if (event.isError) return;
@@ -529,7 +716,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       return;
     }
 
-    if (event.toolName === "bash") {
+    if (canonicalTool === "bash") {
       const fallbackCommand = pendingBashCommands.get(event.toolCallId);
       pendingBashCommands.delete(event.toolCallId);
       if (event.isError) return;
@@ -552,7 +739,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       return;
     }
 
-    if (event.isError || event.toolName !== "read") return;
+    if (event.isError || canonicalTool !== "read") return;
     const input = event.input as { path?: string };
     if (!input?.path) return;
     const resolved = resolveNetworkResource(input.path, trustedHostPatterns);
@@ -605,12 +792,43 @@ export default function webTracker(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("web-render", {
+    description: "Set URL rendering layout  |  args: old | new | status",
+    handler: async (args, ctx) => {
+      const arg = (args || "").trim().toLowerCase();
+      if (!arg || arg === "status") {
+        ctx.ui.notify(`Web render layout: ${webRenderLayout}`, "info");
+        return;
+      }
+
+      if (arg === "old" || arg === "new") {
+        webRenderLayout = arg;
+        persistState();
+        updateWidget(ctx);
+        ctx.ui.notify(`Web render layout: ${webRenderLayout}`, "info");
+        return;
+      }
+
+      ctx.ui.notify("Usage: /web-render old|new|status", "warning");
+    },
+  });
+
   pi.registerCommand("web-approval", {
-    description: "Control untrusted URL handling  |  args: ask | approve | deny | status",
+    description: "Control untrusted URL handling  |  args: ask | approve | deny | status | list",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
       if (!arg || arg === "status") {
         ctx.ui.notify(`Web approval: ${webApprovalMode}`, "info");
+        return;
+      }
+
+      if (arg === "list") {
+        if (trustedHostPatterns.length === 0) {
+          ctx.ui.notify("Trusted URL patterns: (none)", "info");
+          return;
+        }
+        const patternList = trustedHostPatterns.map(pattern => pattern.raw).join("\n  - ");
+        ctx.ui.notify(`Trusted URL patterns:\n  - ${patternList}`, "info");
         return;
       }
 
@@ -621,7 +839,7 @@ export default function webTracker(pi: ExtensionAPI): void {
         return;
       }
 
-      ctx.ui.notify("Usage: /web-approval ask|approve|deny|status", "warning");
+      ctx.ui.notify("Usage: /web-approval ask|approve|deny|status|list", "warning");
     },
   });
 }
