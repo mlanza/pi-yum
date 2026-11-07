@@ -20,6 +20,9 @@ Reload Pi with `/reload` if it is already running.
 | `/web-tracker clear` | Clear the tracked network resources list                                   |
 | `/web-tracker all` | Toggle show-all mode to reveal every tracked resource                      |
 | `/web-tracker limit <N>` | Set the visible-resource limit (default: `8`) and exit show-all mode          |
+| `/web-approval on` | Enable per-call approval prompts for URL-bearing tool calls (`read`, `webfetch`, `bash`, `open_links`) |
+| `/web-approval off` | Disable approval prompts                                                   |
+| `/web-approval` or `/web-approval status` | Show current approval mode (`off` or `ask`) |
 
 ## Configuration
 
@@ -38,6 +41,7 @@ export PI_WEB_TRACKER_TRUSTED_HOST_PATTERNS="pi.dev,github.com,raw.githubusercon
 ## Behavior
 
 - Tracks `read("https://…")` calls, every successful [`webfetch`](https://pi.dev/docs/tools/webfetch) invocation, and successful `bash` calls whose command string contains one or more `http://` / `https://` URLs (for example `curl`, `wget`, or PowerShell web calls run from shell).
+- Optional approval gate: when `/web-approval on` is active, URL-bearing calls to untrusted hosts are paused before execution. URLs matching `PI_WEB_TRACKER_TRUSTED_HOST_PATTERNS` bypass the prompt. For prompted calls, the dialog shows the full tool invocation (`toolName(JSON args)`), then offers approve/deny. If denied, the call is blocked and the turn is terminated.
 - The widget renders as `🌐 | <path> | <domain>` (path is everything after the domain) and sorts entries with the most recently read resources at the top. A right-aligned `📖nnn` counter keeps the numbers tidy. Domains outside `PI_WEB_TRACKER_TRUSTED_HOST_PATTERNS` add a ⚠️ badge and a warning-toned domain so you can pause before trusting new content.
 - When more than eight resources are tracked the header switches from `Read resources (N)` to `Read resources (visible/total)` and a dim footer hints at `/web-tracker all`. Use `/web-tracker limit <N>` to raise the cap and reset the footer.
 - Historical reads survive restarts because the `fileLimit`, `showAll`, and resource list persist via `pi.appendEntry`.

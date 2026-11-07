@@ -7,10 +7,12 @@
  * recognizing URLs as their own domain/path pairs.
  *
  * Commands:
- *   /web-tracker         – toggle widget visibility
- *   /web-tracker clear   – clear tracked network reads from current session
- *   /web-tracker all     – toggle show-all mode for the network list
- *   /web-tracker limit N – set the visible-resource cap (default: 8)
+ *   /web-tracker           – toggle widget visibility
+ *   /web-tracker clear     – clear tracked network reads from current session
+ *   /web-tracker all       – toggle show-all mode for the network list
+ *   /web-tracker limit N   – set the visible-resource cap (default: 8)
+ *   /web-approval on|off   – require approval for URL-bearing tool calls
+ *   /web-approval status   – show current approval mode
  *
  * Placement: ~/.pi/agent/extensions/web-tracker/index.ts
  */
@@ -102,11 +104,20 @@ function isTrustedUrl(url: string, host: string, trustedHostPatterns: TrustedPat
   return trustedHostPatterns.some(({ rx }) => rx.test(url) || (!!host && rx.test(host)));
 }
 
+type WebApprovalMode = "off" | "ask";
+
 interface PersistedState {
   resources: NetworkReadStats[];
   enabled: boolean;
   fileLimit?: number;
   showAll?: boolean;
+  webApprovalMode?: WebApprovalMode;
+}
+
+interface ApprovalDecision {
+  allow: boolean;
+  reason?: string;
+  terminate?: boolean;
 }
 
 const DEFAULT_LIMIT = 8;
@@ -170,6 +181,7 @@ export default function webTracker(pi: ExtensionAPI): void {
   let widgetEnabled = true;
   let fileLimit = DEFAULT_LIMIT;
   let showAll = false;
+  let webApprovalMode: WebApprovalMode = "off";
 
   function persistState(): void {
     pi.appendEntry("web-tracker", {
@@ -177,6 +189,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       enabled: widgetEnabled,
       fileLimit,
       showAll,
+      webApprovalMode,
     } satisfies PersistedState);
   }
 
@@ -193,6 +206,7 @@ export default function webTracker(pi: ExtensionAPI): void {
     widgetEnabled = lastState.enabled ?? true;
     fileLimit = lastState.fileLimit ?? DEFAULT_LIMIT;
     showAll = lastState.showAll ?? false;
+    webApprovalMode = lastState.webApprovalMode === "ask" ? "ask" : "off";
     for (const resource of lastState.resources ?? []) {
       const url = resource.url;
       if (!url) continue;
@@ -285,6 +299,79 @@ export default function webTracker(pi: ExtensionAPI): void {
     });
   }
 
+  function formatToolCall(toolName: string, input: unknown): string {
+    const args = (() => {
+      try {
+        return JSON.stringify(input ?? {}, null, 2) || "{}";
+      } catch {
+        return "{}";
+      }
+    })();
+    return `${toolName}(${args})`;
+  }
+
+  function extractUrlsFromToolCall(toolName: string, input: unknown): string[] {
+    if (toolName === "webfetch") {
+      const url = (input as { url?: unknown })?.url;
+      return typeof url === "string" ? [url] : [];
+    }
+
+    if (toolName === "open_links") {
+      const urls = (input as { urls?: unknown })?.urls;
+      if (!Array.isArray(urls)) return [];
+      return urls.filter((entry): entry is string => typeof entry === "string");
+    }
+
+    if (toolName === "bash") {
+      const command = (input as { command?: unknown })?.command;
+      if (typeof command !== "string") return [];
+      return extractHttpUrls(command);
+    }
+
+    if (toolName === "read") {
+      const path = (input as { path?: unknown })?.path;
+      return typeof path === "string" ? [path] : [];
+    }
+
+    return [];
+  }
+
+  async function requestWebApproval(
+    toolName: string,
+    input: unknown,
+    urls: string[],
+    ctx: ExtensionContext,
+  ): Promise<ApprovalDecision> {
+    if (webApprovalMode !== "ask") return { allow: true };
+    if (!ctx.hasUI) {
+      return {
+        allow: false,
+        reason: "Blocked web call: /web-approval is on, but no interactive UI is available.",
+        terminate: true,
+      };
+    }
+
+    const invocation = formatToolCall(toolName, input);
+    const urlList = urls.map(url => `  • ${url}`).join("\n");
+    const message = [
+      "Untrusted URL(s) detected:",
+      urls.length > 0 ? urlList : "  • (none)",
+      "",
+      "Full tool invocation:",
+      invocation,
+      "",
+      "Choose Yes to allow, No to block.",
+    ].join("\n");
+    const approved = await ctx.ui.confirm("🌐 Pi Web Tracker · Approve call?", message);
+    if (approved) return { allow: true };
+
+    return {
+      allow: false,
+      reason: "Blocked web call by user.",
+      terminate: true,
+    };
+  }
+
   function accumulate(resource: { url: string; domain: string; host: string; path: string; trusted: boolean }): void {
     const now = Date.now();
     const existing = resourceMap.get(resource.url);
@@ -339,7 +426,28 @@ export default function webTracker(pi: ExtensionAPI): void {
     updateWidget(ctx);
   });
 
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", async (event, ctx) => {
+    const resolvedCandidates = extractUrlsFromToolCall(event.toolName, event.input)
+      .map(url => resolveNetworkResource(url, trustedHostPatterns))
+      .filter((resource): resource is NonNullable<typeof resource> => Boolean(resource));
+
+    const untrustedUrls = [...new Set(
+      resolvedCandidates
+        .filter(resource => !resource.trusted)
+        .map(resource => resource.url),
+    )];
+
+    if (untrustedUrls.length > 0) {
+      const approval = await requestWebApproval(event.toolName, event.input, untrustedUrls, ctx);
+      if (!approval.allow) {
+        return {
+          block: true,
+          reason: approval.reason,
+          terminate: approval.terminate,
+        };
+      }
+    }
+
     if (event.toolName === "webfetch") {
       const input = event.input as { url?: string };
       if (input?.url) {
@@ -445,6 +553,33 @@ export default function webTracker(pi: ExtensionAPI): void {
       persistState();
       updateWidget(ctx);
       ctx.ui.notify(`Web tracker widget ${widgetEnabled ? "enabled" : "disabled"}`, "info");
+    },
+  });
+
+  pi.registerCommand("web-approval", {
+    description: "Control URL-call approval  |  args: on | off | status",
+    handler: async (args, ctx) => {
+      const arg = (args || "").trim().toLowerCase();
+      if (!arg || arg === "status") {
+        ctx.ui.notify(`Web approval: ${webApprovalMode}`, "info");
+        return;
+      }
+
+      if (arg === "on") {
+        webApprovalMode = "ask";
+        persistState();
+        ctx.ui.notify("Web approval: on (prompt before URL-bearing calls)", "info");
+        return;
+      }
+
+      if (arg === "off") {
+        webApprovalMode = "off";
+        persistState();
+        ctx.ui.notify("Web approval: off", "info");
+        return;
+      }
+
+      ctx.ui.notify("Usage: /web-approval on|off|status", "warning");
     },
   });
 }
