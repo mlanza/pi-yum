@@ -371,7 +371,7 @@ export default function webTracker(pi: ExtensionAPI): void {
 
     if (ctx.hasUI) {
       ctx.ui.notify(
-        `Pi Web Tracker: untrusted URL call detected (${toolName})`,
+        `Web tracker: untrusted URL call detected (${toolName})`,
         "warning",
       );
     }
@@ -405,7 +405,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       "",
       "Choose Yes to allow, No to block.",
     ].join("\n");
-    const approved = await ctx.ui.confirm("🌐 Pi Web Tracker · Approve call?", message);
+    const approved = await ctx.ui.confirm("🌐 Web tracker · Approve call?", message);
     if (approved) return { allow: true };
 
     return {
@@ -465,7 +465,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       return;
     }
     ctx.ui.notify(
-      `Web tracker trusted-host regexes: ${trustedHostPatterns.map(pattern => pattern.raw).join(", ")}`,
+      `Web tracker trusted-host regexes: ${trustedHostPatterns.map(pattern => pattern.raw).join(", ")}; Web approval: ${webApprovalMode}`,
       "info",
     );
   });
