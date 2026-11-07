@@ -37,21 +37,69 @@ interface NetworkReadStats {
   trusted: boolean;
 }
 
-const TRUSTED_HOST_PATTERNS = [
-  "pi.dev",
-  "github.com",
-  "raw.githubusercontent.com",
-  "cdn.jsdelivr.net",
-  "jina.ai",
-  "r.jina.ai",
-  "boardgamegeek.com",
-  "example.com",
-];
+const TRUSTED_HOSTS_ENV = "PI_WEB_TRACKER_TRUSTED_HOST_PATTERNS";
 
-function isTrustedHost(host: string): boolean {
-  if (!host) return false;
-  const normalized = host.toLowerCase();
-  return TRUSTED_HOST_PATTERNS.some(pattern => normalized === pattern || normalized.endsWith(`.${pattern}`));
+interface TrustedPattern {
+  raw: string;
+  rx: RegExp;
+}
+
+interface TrustedPatternParseResult {
+  patterns: TrustedPattern[];
+  invalid: string[];
+  parseError?: string;
+}
+
+function parseTrustedHostPatterns(value: string | undefined): TrustedPatternParseResult {
+  if (!value) return { patterns: [], invalid: [] };
+
+  const trimmed = value.trim();
+  let rawPatterns: string[] = [];
+
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!Array.isArray(parsed)) {
+        return {
+          patterns: [],
+          invalid: [],
+          parseError: `expected a JSON array in ${TRUSTED_HOSTS_ENV}`,
+        };
+      }
+      rawPatterns = parsed
+        .filter((entry): entry is string => typeof entry === "string")
+        .map(entry => entry.trim())
+        .filter(Boolean);
+    } catch {
+      return {
+        patterns: [],
+        invalid: [],
+        parseError: `invalid JSON in ${TRUSTED_HOSTS_ENV}`,
+      };
+    }
+  } else {
+    // Backward-compatible fallback for older comma-separated values.
+    rawPatterns = trimmed.split(",").map(part => part.trim()).filter(Boolean);
+  }
+
+  const dedupedRawPatterns = [...new Set(rawPatterns)];
+  const patterns: TrustedPattern[] = [];
+  const invalid: string[] = [];
+
+  for (const raw of dedupedRawPatterns) {
+    try {
+      patterns.push({ raw, rx: new RegExp(raw, "i") });
+    } catch {
+      invalid.push(raw);
+    }
+  }
+
+  return { patterns, invalid };
+}
+
+function isTrustedUrl(url: string, host: string, trustedHostPatterns: TrustedPattern[]): boolean {
+  if (trustedHostPatterns.length === 0) return false;
+  return trustedHostPatterns.some(({ rx }) => rx.test(url) || (!!host && rx.test(host)));
 }
 
 interface PersistedState {
@@ -62,8 +110,24 @@ interface PersistedState {
 }
 
 const DEFAULT_LIMIT = 8;
+const URL_IN_COMMAND_RX = /\bhttps?:\/\/[^\s"'`<>]+/gi;
 
-function resolveNetworkResource(candidate: string): { url: string; domain: string; host: string; path: string; trusted: boolean } | undefined {
+function extractHttpUrls(text: string): string[] {
+  const matches = text.match(URL_IN_COMMAND_RX) ?? [];
+  const deduped = new Set<string>();
+  for (const raw of matches) {
+    const cleaned = raw
+      .replace(/^[\("'`<\[]+/, "")
+      .replace(/[\)\]}'",.;!?]+$/, "");
+    if (cleaned) deduped.add(cleaned);
+  }
+  return [...deduped];
+}
+
+function resolveNetworkResource(
+  candidate: string,
+  trustedHostPatterns: TrustedPattern[],
+): { url: string; domain: string; host: string; path: string; trusted: boolean } | undefined {
   const trimmed = candidate.trim();
   if (!trimmed) return undefined;
   let parsed: URL;
@@ -81,12 +145,13 @@ function resolveNetworkResource(candidate: string): { url: string; domain: strin
   const query = parsed.search || "";
   const hash = parsed.hash || "";
   const path = `${pathname}${query}${hash}`;
+  const canonicalUrl = parsed.toString();
   return {
-    url: parsed.toString(),
+    url: canonicalUrl,
     domain,
     host,
     path: path === "" ? "/" : path,
-    trusted: isTrustedHost(host),
+    trusted: isTrustedUrl(canonicalUrl, host, trustedHostPatterns),
   };
 }
 
@@ -95,6 +160,13 @@ function resolveNetworkResource(candidate: string): { url: string; domain: strin
 export default function webTracker(pi: ExtensionAPI): void {
   const resourceMap = new Map<string, NetworkReadStats>();
   const pendingWebfetchUrls = new Map<string, string>();
+  const pendingBashCommands = new Map<string, string>();
+  const {
+    patterns: trustedHostPatterns,
+    invalid: invalidTrustedHostPatterns,
+    parseError: trustedHostPatternParseError,
+  } = parseTrustedHostPatterns(process.env[TRUSTED_HOSTS_ENV]);
+  let trustConfigNoticeShown = false;
   let widgetEnabled = true;
   let fileLimit = DEFAULT_LIMIT;
   let showAll = false;
@@ -139,7 +211,7 @@ export default function webTracker(pi: ExtensionAPI): void {
         path: resource.path ?? "/",
         readCount: typeof resource.readCount === "number" ? resource.readCount : 0,
         lastRead: typeof resource.lastRead === "number" ? resource.lastRead : 0,
-        trusted: typeof resource.trusted === "boolean" ? resource.trusted : isTrustedHost(host),
+        trusted: isTrustedUrl(url, host, trustedHostPatterns),
       };
       resourceMap.set(url, normalized);
     }
@@ -183,15 +255,17 @@ export default function webTracker(pi: ExtensionAPI): void {
           const dimSep = theme.fg("dim", " | ");
           for (const resource of visibleResources) {
             const pathLabel = resource.path || "/";
-            const trustBadge = resource.trusted ? "" : `${theme.fg("error", "⚠️ ")}`;
-            const leftPart = `${trustBadge}🌐 ${dimSep}${theme.fg("accent", theme.bold(pathLabel))}`;
+            const warningSlot = resource.trusted ? "  " : theme.fg("error", "⚠️");
+            const globeSlot = "🌐";
+            const gutter = `${warningSlot}${globeSlot} `;
+            const pathStr = theme.fg("accent", theme.bold(pathLabel));
             const domainStr = resource.trusted
               ? theme.fg("dim", resource.domain)
               : theme.fg("warning", resource.domain);
-            const leftWithDomain = `${leftPart}${dimSep}${domainStr}`;
+            const leftPart = `${gutter}${dimSep}${pathStr}${dimSep}${domainStr}`;
             const countStr = theme.fg("warning", `📖${resource.readCount.toString().padStart(3, " ")}`);
-            const gap = Math.max(1, width - visibleWidth(leftWithDomain) - visibleWidth(countStr));
-            lines.push(truncateToWidth(`${leftWithDomain}${" ".repeat(gap)}${countStr}`, width));
+            const gap = Math.max(1, width - visibleWidth(leftPart) - visibleWidth(countStr));
+            lines.push(truncateToWidth(`${leftPart}${" ".repeat(gap)}${countStr}`, width));
           }
 
           if (hiddenCount > 0) {
@@ -219,7 +293,7 @@ export default function webTracker(pi: ExtensionAPI): void {
       existing.lastRead = now;
       existing.domain = resource.domain;
       existing.host = resource.host;
-      existing.trusted = existing.trusted && resource.trusted;
+      existing.trusted = resource.trusted;
     } else {
       resourceMap.set(resource.url, {
         url: resource.url,
@@ -236,6 +310,28 @@ export default function webTracker(pi: ExtensionAPI): void {
   pi.on("session_start", (_evt, ctx) => {
     restoreFromSession(ctx);
     updateWidget(ctx);
+    if (trustConfigNoticeShown || !ctx.hasUI) return;
+    trustConfigNoticeShown = true;
+    if (trustedHostPatternParseError) {
+      ctx.ui.notify(`Web tracker: ${trustedHostPatternParseError}`, "warning");
+    }
+    if (invalidTrustedHostPatterns.length > 0) {
+      ctx.ui.notify(
+        `Web tracker: invalid trusted-host regex ignored: ${invalidTrustedHostPatterns.join(", ")}`,
+        "warning",
+      );
+    }
+    if (trustedHostPatterns.length === 0) {
+      ctx.ui.notify(
+        `Web tracker: no trusted-host regex configured. Set ${TRUSTED_HOSTS_ENV} to a JSON array of regex strings.`,
+        "warning",
+      );
+      return;
+    }
+    ctx.ui.notify(
+      `Web tracker trusted-host regexes: ${trustedHostPatterns.map(pattern => pattern.raw).join(", ")}`,
+      "info",
+    );
   });
 
   pi.on("session_tree", (_evt, ctx) => {
@@ -249,19 +345,26 @@ export default function webTracker(pi: ExtensionAPI): void {
       if (input?.url) {
         pendingWebfetchUrls.set(event.toolCallId, input.url);
       }
+      return;
+    }
+
+    if (event.toolName === "bash") {
+      const input = event.input as { command?: string };
+      if (input?.command) {
+        pendingBashCommands.set(event.toolCallId, input.command);
+      }
     }
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.isError) return;
-
     if (event.toolName === "webfetch") {
       const fallbackUrl = pendingWebfetchUrls.get(event.toolCallId);
       pendingWebfetchUrls.delete(event.toolCallId);
+      if (event.isError) return;
       const details = event.details as { finalUrl?: string; url?: string } | undefined;
       const candidateUrl = details?.finalUrl || details?.url || fallbackUrl || (event.input as { url?: string })?.url;
       if (!candidateUrl) return;
-      const resolved = resolveNetworkResource(candidateUrl);
+      const resolved = resolveNetworkResource(candidateUrl, trustedHostPatterns);
       if (!resolved) return;
       accumulate(resolved);
       persistState();
@@ -269,10 +372,33 @@ export default function webTracker(pi: ExtensionAPI): void {
       return;
     }
 
-    if (event.toolName !== "read") return;
+    if (event.toolName === "bash") {
+      const fallbackCommand = pendingBashCommands.get(event.toolCallId);
+      pendingBashCommands.delete(event.toolCallId);
+      if (event.isError) return;
+      const command = fallbackCommand || (event.input as { command?: string })?.command;
+      if (!command) return;
+      const urls = extractHttpUrls(command);
+      if (urls.length === 0) return;
+
+      let changed = false;
+      for (const candidateUrl of urls) {
+        const resolved = resolveNetworkResource(candidateUrl, trustedHostPatterns);
+        if (!resolved) continue;
+        accumulate(resolved);
+        changed = true;
+      }
+
+      if (!changed) return;
+      persistState();
+      updateWidget(ctx);
+      return;
+    }
+
+    if (event.isError || event.toolName !== "read") return;
     const input = event.input as { path?: string };
     if (!input?.path) return;
-    const resolved = resolveNetworkResource(input.path);
+    const resolved = resolveNetworkResource(input.path, trustedHostPatterns);
     if (!resolved) return;
     accumulate(resolved);
     persistState();
