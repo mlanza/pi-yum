@@ -11,8 +11,8 @@
  *   /web-tracker clear     – clear tracked network reads from current session
  *   /web-tracker all       – toggle show-all mode for the network list
  *   /web-tracker limit N   – set the visible-resource cap (default: 8)
- *   /web-approval on|off   – require approval for URL-bearing tool calls
- *   /web-approval status   – show current approval mode
+ *   /web-approval ask|approve|deny – set untrusted URL handling mode
+ *   /web-approval status           – show current approval mode
  *
  * Placement: ~/.pi/agent/extensions/web-tracker/index.ts
  */
@@ -40,6 +40,7 @@ interface NetworkReadStats {
 }
 
 const TRUSTED_HOSTS_ENV = "PI_WEB_TRACKER_TRUSTED_HOST_PATTERNS";
+const WEB_APPROVAL_MODE_ENV = "PI_WEB_TRACKER_APPROVAL_MODE";
 
 interface TrustedPattern {
   raw: string;
@@ -104,7 +105,16 @@ function isTrustedUrl(url: string, host: string, trustedHostPatterns: TrustedPat
   return trustedHostPatterns.some(({ rx }) => rx.test(url) || (!!host && rx.test(host)));
 }
 
-type WebApprovalMode = "off" | "ask";
+type WebApprovalMode = "ask" | "approve" | "deny";
+
+function parseWebApprovalMode(value: string | undefined): WebApprovalMode | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "ask" || normalized === "approve" || normalized === "deny") {
+    return normalized;
+  }
+  return undefined;
+}
 
 interface PersistedState {
   resources: NetworkReadStats[];
@@ -177,11 +187,16 @@ export default function webTracker(pi: ExtensionAPI): void {
     invalid: invalidTrustedHostPatterns,
     parseError: trustedHostPatternParseError,
   } = parseTrustedHostPatterns(process.env[TRUSTED_HOSTS_ENV]);
+  const envWebApprovalModeRaw = process.env[WEB_APPROVAL_MODE_ENV];
+  const envWebApprovalModeParsed = parseWebApprovalMode(envWebApprovalModeRaw);
+  const defaultWebApprovalMode: WebApprovalMode = envWebApprovalModeParsed ?? "deny";
+  const webApprovalModeEnvInvalid = !!envWebApprovalModeRaw && !envWebApprovalModeParsed;
+
   let trustConfigNoticeShown = false;
   let widgetEnabled = true;
   let fileLimit = DEFAULT_LIMIT;
   let showAll = false;
-  let webApprovalMode: WebApprovalMode = "off";
+  let webApprovalMode: WebApprovalMode = defaultWebApprovalMode;
 
   function persistState(): void {
     pi.appendEntry("web-tracker", {
@@ -206,7 +221,17 @@ export default function webTracker(pi: ExtensionAPI): void {
     widgetEnabled = lastState.enabled ?? true;
     fileLimit = lastState.fileLimit ?? DEFAULT_LIMIT;
     showAll = lastState.showAll ?? false;
-    webApprovalMode = lastState.webApprovalMode === "ask" ? "ask" : "off";
+    // Backward compatibility: prior "off" maps to "approve".
+    const persistedMode = (lastState as PersistedState & { webApprovalMode?: string }).webApprovalMode;
+    webApprovalMode = persistedMode === "ask"
+      ? "ask"
+      : persistedMode === "approve"
+        ? "approve"
+        : persistedMode === "deny"
+          ? "deny"
+          : persistedMode === "off"
+            ? "approve"
+            : defaultWebApprovalMode;
     for (const resource of lastState.resources ?? []) {
       const url = resource.url;
       if (!url) continue;
@@ -342,12 +367,30 @@ export default function webTracker(pi: ExtensionAPI): void {
     urls: string[],
     ctx: ExtensionContext,
   ): Promise<ApprovalDecision> {
-    if (webApprovalMode !== "ask") return { allow: true };
+    if (urls.length === 0) return { allow: true };
+
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `Pi Web Tracker: untrusted URL call detected (${toolName})`,
+        "warning",
+      );
+    }
+
+    if (webApprovalMode === "approve") {
+      return { allow: true };
+    }
+
+    if (webApprovalMode === "deny") {
+      return {
+        allow: false,
+        reason: "Blocked web call: /web-approval deny mode",
+      };
+    }
+
     if (!ctx.hasUI) {
       return {
         allow: false,
-        reason: "Blocked web call: /web-approval is on, but no interactive UI is available.",
-        terminate: true,
+        reason: "Blocked web call: /web-approval ask mode requires interactive UI.",
       };
     }
 
@@ -401,6 +444,12 @@ export default function webTracker(pi: ExtensionAPI): void {
     trustConfigNoticeShown = true;
     if (trustedHostPatternParseError) {
       ctx.ui.notify(`Web tracker: ${trustedHostPatternParseError}`, "warning");
+    }
+    if (webApprovalModeEnvInvalid) {
+      ctx.ui.notify(
+        `Web tracker: invalid ${WEB_APPROVAL_MODE_ENV} value \"${envWebApprovalModeRaw}\"; using ${defaultWebApprovalMode}`,
+        "warning",
+      );
     }
     if (invalidTrustedHostPatterns.length > 0) {
       ctx.ui.notify(
@@ -557,7 +606,7 @@ export default function webTracker(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("web-approval", {
-    description: "Control URL-call approval  |  args: on | off | status",
+    description: "Control untrusted URL handling  |  args: ask | approve | deny | status",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
       if (!arg || arg === "status") {
@@ -565,21 +614,14 @@ export default function webTracker(pi: ExtensionAPI): void {
         return;
       }
 
-      if (arg === "on") {
-        webApprovalMode = "ask";
+      if (arg === "ask" || arg === "approve" || arg === "deny") {
+        webApprovalMode = arg;
         persistState();
-        ctx.ui.notify("Web approval: on (prompt before URL-bearing calls)", "info");
+        ctx.ui.notify(`Web approval: ${webApprovalMode}`, "info");
         return;
       }
 
-      if (arg === "off") {
-        webApprovalMode = "off";
-        persistState();
-        ctx.ui.notify("Web approval: off", "info");
-        return;
-      }
-
-      ctx.ui.notify("Usage: /web-approval on|off|status", "warning");
+      ctx.ui.notify("Usage: /web-approval ask|approve|deny|status", "warning");
     },
   });
 }
