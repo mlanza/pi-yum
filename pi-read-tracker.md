@@ -33,7 +33,7 @@ Omit the flag (default) for zero logging overhead.
 | `/read-tracker`     | Toggle the read-files widget on/off       |
 | `/read-tracker clear` | Clear the tracked read-files list         |
 | `/read-tracker all` | Toggle show-all mode to reveal every tracked file |
-| `/read-tracker limit <N>` | Set the visible-file limit (default: `8`) and exit show-all mode |
+| `/read-tracker limit <N>` | Set the visible-file limit (default: `7`) and exit show-all mode |
 | `/read-tracker audit` | Show every recorded command that caused a file to be tracked as a read. Picks the file via an interactive TUI selector. |
 
 ## Behavior

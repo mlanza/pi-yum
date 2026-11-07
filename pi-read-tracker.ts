@@ -197,7 +197,7 @@ export default function readTracker(pi: ExtensionAPI): void {
   /** Simple oracle: absolute paths confirmed as files this session. No extra deps. */
   const fileMemo = new Set<string>();
   let widgetEnabled = true;
-  let fileLimit = 8;
+  let fileLimit = 7;
   let showAll = false;
   let cwd = process.cwd();
   // Capture bash commands for read inference
@@ -328,7 +328,7 @@ export default function readTracker(pi: ExtensionAPI): void {
     }
     if (lastState) {
       widgetEnabled = lastState.enabled ?? true;
-      fileLimit = lastState.fileLimit ?? 8;
+      fileLimit = lastState.fileLimit ?? 7;
       showAll = lastState.showAll ?? false;
       // Restore audit log
       if (lastState.auditLog) {

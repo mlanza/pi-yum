@@ -19,7 +19,7 @@ Reload Pi with `/reload` if it is already running.
 | `/web-tracker`     | Toggle the network-resource widget on/off                                 |
 | `/web-tracker clear` | Clear the tracked network resources list                                   |
 | `/web-tracker all` | Toggle show-all mode to reveal every tracked resource                      |
-| `/web-tracker limit <N>` | Set the visible-resource limit (default: `8`) and exit show-all mode          |
+| `/web-tracker limit <N>` | Set the visible-resource limit (default: `7`) and exit show-all mode          |
 | `/web-approval ask` | Prompt for untrusted URL-bearing calls (any tool call whose arguments include an HTTP/HTTPS URL) |
 | `/web-approval approve` | Allow untrusted URL calls without prompts (still shows a warning notification) |
 | `/web-approval deny` | Block untrusted URL calls without prompting |

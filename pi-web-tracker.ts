@@ -10,7 +10,7 @@
  *   /web-tracker           – toggle widget visibility
  *   /web-tracker clear     – clear tracked network reads from current session
  *   /web-tracker all       – toggle show-all mode for the network list
- *   /web-tracker limit N   – set the visible-resource cap (default: 8)
+ *   /web-tracker limit N   – set the visible-resource cap (default: 7)
  *   /web-approval ask|approve|deny – set untrusted URL handling mode
  *   /web-approval status           – show current approval mode
  *   /web-approval list             – list trusted URL regex patterns
@@ -166,7 +166,7 @@ interface ApprovalDecision {
   terminate?: boolean;
 }
 
-const DEFAULT_LIMIT = 8;
+const DEFAULT_LIMIT = 7;
 const URL_IN_COMMAND_RX = /\bhttps?:\/\/[^\s"'`<>]+/gi;
 
 type UrlLayout = "old" | "new";
@@ -555,11 +555,11 @@ export default function webTracker(pi: ExtensionAPI): void {
       invocation,
       "",
       addableTrust
-        ? `Choose Yes to allow, No to block, or Add (${addableTrust.labelUrl}) to trust for this session.`
+        ? `Choose Yes to allow, No to block, or Trust (${addableTrust.labelUrl}) for this session.`
         : "Choose Yes to allow or No to block.",
     ].join("\n");
 
-    const addChoice = addableTrust ? `Add (${addableTrust.labelUrl})` : undefined;
+    const addChoice = addableTrust ? `Trust (${addableTrust.labelUrl})` : undefined;
     const choices = addChoice ? ["Yes", "No", addChoice] : ["Yes", "No"];
     const picked = await ctx.ui.select(`🌐 Web tracker · Approve call?\n\n${message}`, choices);
 
