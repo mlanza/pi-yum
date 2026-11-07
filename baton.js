@@ -8,8 +8,8 @@
  * Usage:
  *   /baton                     → new session with last response, waits for input
  *   /baton now summarize       → new session + auto-trigger with addendum
- *   tools.baton()              → same as /baton
- *   tools.baton("Continue…")   → same as /baton <addendum>
+ *   tools.baton({})                          → same as /baton
+ *   tools.baton({ addendum: "Continue…" })  → same as /baton <addendum>
  *
  * Based on PRD: leap-prd.md (s/baton/leap)
  * Document version: 1.0.0
@@ -37,8 +37,8 @@ let debugLogPath = null;
  * Lazy-init a JSONL debug log adjacent to this extension file.
  * Records each baton invocation with context for post-hoc analysis.
  *
- * @param {string} method - "command", "tool", or "batondebug"
- * @param {{ addendum?: string; branchLength?: number; durationMs?: number; ok?: boolean; error?: string; data?: unknown }} info
+ * @param {string} method - "command" or "tool"
+ * @param {{ addendum?: string; branchLength?: number; durationMs?: number; ok?: boolean; error?: string }} info
  */
 async function debugLog(method, info) {
   try {
@@ -58,10 +58,6 @@ async function debugLog(method, info) {
       d: info.durationMs ?? 0,
       ok: info.ok ?? true,
       e: info.error ?? null,
-      // Arbitrary structured data passed via batondebug tool
-      ...(info.data !== undefined && info.data !== null
-        ? { data: info.data }
-        : {}),
     };
 
     await appendFile(debugLogPath, JSON.stringify(entry) + "\n", "utf8");
@@ -213,66 +209,6 @@ ${lastText}`;
           ok: !cancelled,
         });
       }
-    },
-  });
-
-  // ---- Tool: batondebug(message, data?) ----------------------------------
-  //
-  // Self-instrumentation tool the LLM can call to log arbitrary observations
-  // to the debug log for post-hoc analysis.
-
-  pi.registerTool({
-    name: "batondebug",
-    label: "baton Debug",
-    description:
-      "Log arbitrary debug info to the baton extension's debug log. " +
-      "Useful for self-instrumentation — call this whenever you want to " +
-      "record something interesting for later analysis.",
-
-    promptSnippet: "Log debug info to the baton extension debug log",
-    promptGuidelines: [
-      "Use batondebug to record observations, decisions, or state snapshots while working.",
-      "The log is written to baton-debug.jsonl adjacent to the baton extension.",
-    ],
-
-    parameters: Type.Object({
-      message: Type.String({
-        description: "Description of what's being logged.",
-      }),
-      data: Type.Optional(
-        Type.Object({}, {
-          additionalProperties: true,
-          description: "Optional structured data to include.",
-        }),
-      ),
-    }),
-
-    /**
-     * @param {string} _toolCallId
-     * @param {{ message: string; data?: Record<string, unknown> }} params
-     * @param {AbortSignal} _signal
-     * @param {(update: any) => void} _onUpdate
-     * @param {import("@earendil-works/pi-coding-agent").ExtensionContext} ctx
-     */
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const branch = ctx.sessionManager.getBranch();
-
-      await debugLog("batondebug", {
-        addendum: params.message,
-        branchLength: branch.length,
-        ok: true,
-        data: params.data ?? null,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Logged to debug log: ${params.message}`,
-          },
-        ],
-        details: {},
-      };
     },
   });
 
