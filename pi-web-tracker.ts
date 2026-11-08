@@ -7,10 +7,11 @@
  * recognizing URLs as their own domain/path pairs.
  *
  * Commands:
- *   /web-tracker           – toggle widget visibility
- *   /web-tracker clear     – clear tracked network reads from current session
- *   /web-tracker all       – toggle show-all mode for the network list
- *   /web-tracker limit N   – set the visible-resource cap (default: 7)
+ *   /web-tracker                 – show tracker status/help (safe default)
+ *   /web-tracker show|hide|toggle – control widget visibility explicitly
+ *   /web-tracker clear           – clear tracked network reads from current session
+ *   /web-tracker all             – toggle show-all mode for the network list
+ *   /web-tracker limit N         – set the visible-resource cap (default: 7)
  *   /web-approval ask|approve|deny – set untrusted URL handling mode
  *   /web-approval status           – show current approval mode
  *   /web-approval list             – list trusted URL regex patterns
@@ -750,9 +751,44 @@ export default function webTracker(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("web-tracker", {
-    description: "Toggle network-resource widget  |  args: clear | all | limit <N>",
+    description: "Network-resource tracker  |  args: status|show|hide|toggle|all|limit <N>|clear",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
+
+      if (!arg || arg === "status") {
+        const trackedCount = resourceMap.size;
+        ctx.ui.notify(
+          `Web tracker: ${widgetEnabled ? "visible" : "hidden"}; resources: ${trackedCount}; display: ${showAll ? "all" : `last ${fileLimit}`}`,
+          "info",
+        );
+        ctx.ui.notify("Usage: /web-tracker show|hide|toggle|all|limit <N>|clear", "info");
+        return;
+      }
+
+      if (arg === "show") {
+        widgetEnabled = true;
+        persistState();
+        updateWidget(ctx);
+        ctx.ui.notify("Web tracker widget enabled", "info");
+        return;
+      }
+
+      if (arg === "hide") {
+        widgetEnabled = false;
+        persistState();
+        updateWidget(ctx);
+        ctx.ui.notify("Web tracker widget disabled", "info");
+        return;
+      }
+
+      if (arg === "toggle") {
+        widgetEnabled = !widgetEnabled;
+        persistState();
+        updateWidget(ctx);
+        ctx.ui.notify(`Web tracker widget ${widgetEnabled ? "enabled" : "disabled"}`, "info");
+        return;
+      }
+
       if (arg === "clear") {
         resourceMap.clear();
         persistState();
@@ -760,6 +796,7 @@ export default function webTracker(pi: ExtensionAPI): void {
         ctx.ui.notify("Web tracker: cleared", "info");
         return;
       }
+
       if (arg === "all") {
         showAll = !showAll;
         persistState();
@@ -772,6 +809,7 @@ export default function webTracker(pi: ExtensionAPI): void {
         );
         return;
       }
+
       if (arg.startsWith("limit ")) {
         const n = parseInt(arg.slice(6), 10);
         if (!isNaN(n) && n > 0) {
@@ -785,10 +823,8 @@ export default function webTracker(pi: ExtensionAPI): void {
         }
         return;
       }
-      widgetEnabled = !widgetEnabled;
-      persistState();
-      updateWidget(ctx);
-      ctx.ui.notify(`Web tracker widget ${widgetEnabled ? "enabled" : "disabled"}`, "info");
+
+      ctx.ui.notify("Usage: /web-tracker status|show|hide|toggle|all|limit <N>|clear", "warning");
     },
   });
 
