@@ -138,7 +138,7 @@ function firstLine(text) {
 function renderBrainjamMessage(message, options, theme) {
   const content = String(message?.content ?? "");
   const summary = firstLine(content);
-  let text = `${theme.fg("accent", "[brainjam-bootstrap]")} ${summary}`;
+  let text = `${theme.fg("accent", "[bootstrap-brainjam]")} ${summary}`;
 
   if (options.expanded) {
     text += `\n\n${content}`;
@@ -161,6 +161,7 @@ function renderBrainjamMessage(message, options, theme) {
  */
 export default function brainjamExtension(pi) {
   pi.registerMessageRenderer("brainjam-bootstrap", renderBrainjamMessage);
+  pi.registerMessageRenderer("bootstrap-brainjam", renderBrainjamMessage); // legacy tag
   pi.registerMessageRenderer("brainjam-file-bootstrap", renderBrainjamMessage);
 
   let cachedConfig = null;
@@ -185,8 +186,16 @@ export default function brainjamExtension(pi) {
     bootstrapReady = (async () => {
       bootstrapPostedForSession = false;
 
-      // Only run automatically for /new sessions.
-      if (event.reason !== "new") return;
+      cachedConfig = await loadConfig(ctx.cwd);
+      pendingFileCommands = [];
+      fileCommandsSeeded = false;
+      bootstrapContent = null;
+
+      // Run full bootstrap for true startup/new sessions.
+      const shouldRunBootstrap = event.reason === "new" || event.reason === "startup";
+
+      // Ignore non-startup session reasons.
+      if (!shouldRunBootstrap) return;
 
       const timeoutController = new AbortController();
       const timeoutHandle = setTimeout(() => {
@@ -194,13 +203,8 @@ export default function brainjamExtension(pi) {
       }, BOOTSTRAP_TIMEOUT_MS);
 
       try {
-        cachedConfig = await loadConfig(ctx.cwd);
-        pendingFileCommands = [];
-        fileCommandsSeeded = false;
-        bootstrapContent = null;
-
         if (!cachedConfig) {
-          ctx.ui.notify("[brainjam] no config found (.brainjamrc not loaded).", "info");
+          await postBootstrap("❌ Brainjam: no config found (.brainjamrc not loaded).");
           return;
         }
 
