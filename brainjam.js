@@ -41,18 +41,26 @@ function parseCommands(content) {
 }
 
 function candidateConfigPaths(cwd) {
-  const home = os.homedir();
-  const xdg = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  const home = path.resolve(os.homedir());
+  const xdgRaw = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+  const xdg = path.isAbsolute(xdgRaw) ? xdgRaw : path.resolve(cwd, xdgRaw);
 
-  return [
+  const candidates = [
+    // Always check cwd first.
+    path.join(cwd, ".brainjamrc"),
+
+    // Common user-level config locations.
     path.join(xdg, "brainjam", ".brainjamrc"),
     path.join(xdg, "brainjam", "brainjamrc"),
     path.join(home, ".brainjamrc"),
+
+    // Pi-specific fallbacks.
     path.join(home, ".pi", "brainjam", ".brainjamrc"),
     path.join(home, ".pi", "brainjam", "brainjamrc"),
     path.join(home, ".pi", "agent", "brainjamrc"),
-    path.join(cwd, ".brainjamrc"),
   ];
+
+  return unique(candidates.map((p) => path.resolve(p)));
 }
 
 async function loadConfig(cwd) {
@@ -62,10 +70,10 @@ async function loadConfig(cwd) {
     if (!(await existsFile(filePath))) continue;
     const raw = await readFile(filePath, "utf8");
     const commands = parseCommands(raw);
-    return { path: filePath, raw, commands };
+    return { config: { path: filePath, raw, commands }, candidates };
   }
 
-  return null;
+  return { config: null, candidates };
 }
 
 function unique(items) {
@@ -186,7 +194,8 @@ export default function brainjamExtension(pi) {
     bootstrapReady = (async () => {
       bootstrapPostedForSession = false;
 
-      cachedConfig = await loadConfig(ctx.cwd);
+      const configResult = await loadConfig(ctx.cwd);
+      cachedConfig = configResult.config;
       pendingFileCommands = [];
       fileCommandsSeeded = false;
       bootstrapContent = null;
@@ -204,7 +213,11 @@ export default function brainjamExtension(pi) {
 
       try {
         if (!cachedConfig) {
-          await postBootstrap("❌ Brainjam: no config found (.brainjamrc not loaded).");
+          const looked = configResult.candidates.map((p) => `- ${p}`).join("\n");
+          await postBootstrap(`❌ Brainjam: no config found (.brainjamrc not loaded).
+
+Checked ${configResult.candidates.length} locations (in order):
+${looked}`);
           return;
         }
 
@@ -266,7 +279,7 @@ Config source: ${cachedConfig.path}
 Prompt file detected: (none at session start)
 ${pendingLine}
 
-.brainjamrc contents:
+Config contents:
 ${cachedConfig.raw.trim() || "(empty)"}
 
 Captured command run:
