@@ -75,6 +75,14 @@ function unique(items) {
   return [...new Set(items)];
 }
 
+function toHomeTilde(filePath) {
+  const home = path.resolve(os.homedir());
+  const resolved = path.resolve(filePath);
+  if (resolved === home) return "~";
+  if (resolved.startsWith(`${home}${path.sep}`)) return `~${resolved.slice(home.length)}`;
+  return filePath;
+}
+
 async function runCommand(pi, command, signal) {
   if (process.platform === "win32") {
     return pi.exec("cmd", ["/d", "/s", "/c", command], { signal });
@@ -172,7 +180,7 @@ export default function systemPromptExtension(pi) {
 
       try {
         if (!cachedConfig) {
-          const looked = configResult.candidates.map((p) => `- ${p}`).join("\n");
+          const looked = configResult.candidates.map((p) => `- ${toHomeTilde(p)}`).join("\n");
           await postBootstrap(`❌ System Prompt: no config found (.systempromptrc not loaded).
 
 Checked ${configResult.candidates.length} locations (in order):
@@ -214,9 +222,14 @@ ${looked}`);
         }
 
         const failures = results.filter((r) => r.exitCode !== 0).length;
-        const summary = timedOut || failures > 0
-          ? `❌ System Prompt failed${timedOut ? ` (timed out at ${BOOTSTRAP_TIMEOUT_MS}ms)` : ""}${failures > 0 ? ` (${failures} command issue(s))` : ""}`
-          : "✅ System Prompt loaded.";
+        const hasFailure = timedOut || failures > 0;
+        const configPath = toHomeTilde(cachedConfig.path);
+        const heading = hasFailure
+          ? `❌ System prompt failed to load from ${configPath}`
+          : `✅ System prompt loaded from ${configPath}`;
+        const detail = hasFailure
+          ? `${timedOut ? `Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms` : ""}${timedOut && failures > 0 ? " " : ""}${failures > 0 ? `${failures} command issue(s)` : ""}`
+          : "";
 
         const configWithExitCodes = formatConfigWithExitCodes(
           cachedConfig.commands,
@@ -225,9 +238,7 @@ ${looked}`);
         const stdoutContent = collectOutput(results, "stdout");
         const stderrContent = collectOutput(results, "stderr");
 
-        bootstrapContent = `${summary}
-
-Config source: ${cachedConfig.path}
+        bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
 
 ${configWithExitCodes}
 
