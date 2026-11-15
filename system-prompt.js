@@ -167,10 +167,10 @@ export default function systemPromptExtension(pi) {
       cachedConfig = configResult.config;
       bootstrapContent = null;
 
-      // Run bootstrap only for freshly-created sessions.
-      const shouldRunBootstrap = event.reason === "new";
+      // Run bootstrap for fresh sessions created via /new and for initial app startup.
+      const shouldRunBootstrap = event.reason === "new" || event.reason === "startup";
 
-      // Ignore startup/reload/resume/fork.
+      // Ignore reload/resume/fork.
       if (!shouldRunBootstrap) return;
 
       const timeoutController = new AbortController();
