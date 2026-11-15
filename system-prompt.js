@@ -26,13 +26,6 @@ async function existsFile(filePath) {
   }
 }
 
-function shellQuote(filePath) {
-  if (process.platform === "win32") {
-    return `"${filePath.replaceAll('"', '""')}"`;
-  }
-  return `'${filePath.replaceAll("'", "'\\''")}'`;
-}
-
 function parseCommands(content) {
   return content
     .split(/\r?\n/)
@@ -82,48 +75,6 @@ function unique(items) {
   return [...new Set(items)];
 }
 
-function extractPathLikeTokens(prompt) {
-  const hits = [];
-
-  const fenced = prompt.match(/`([^`]+)`/g) || [];
-  for (const m of fenced) hits.push(m.slice(1, -1));
-
-  const quoted = prompt.match(/"([^"]+)"|'([^']+)'/g) || [];
-  for (const m of quoted) hits.push(m.slice(1, -1));
-
-  const bare = prompt.match(/(?:\.{1,2}\/|~\/|\/)?[\w@.%+-]+(?:\/[\w@.%+\-]+)*(?:\.[\w.-]+)?/g) || [];
-  for (const m of bare) hits.push(m);
-
-  return unique(
-    hits
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .filter((s) => s.includes("/") || s.startsWith(".") || /\.[A-Za-z0-9]{1,8}$/.test(s)),
-  );
-}
-
-function resolvePromptPath(rawPath, cwd) {
-  const expanded = rawPath.startsWith("~/")
-    ? path.join(os.homedir(), rawPath.slice(2))
-    : rawPath;
-  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(cwd, expanded);
-}
-
-async function findMentionedFile(prompt, cwd) {
-  const candidates = extractPathLikeTokens(prompt);
-  for (const c of candidates) {
-    const resolved = resolvePromptPath(c, cwd);
-    if (await existsFile(resolved)) return resolved;
-  }
-  return null;
-}
-
-function expandCommand(command, filePath) {
-  if (!filePath) return command;
-  const quoted = shellQuote(filePath);
-  return command.replaceAll("{{file}}", quoted).replaceAll("{file}", quoted);
-}
-
 async function runCommand(pi, command, signal) {
   if (process.platform === "win32") {
     return pi.exec("cmd", ["/d", "/s", "/c", command], { signal });
@@ -131,14 +82,22 @@ async function runCommand(pi, command, signal) {
   return pi.exec("sh", ["-lc", command], { signal });
 }
 
-function formatCommandResult(result) {
-  const stdout = result.stdout || "";
-  const stderr = result.stderr || "";
+function formatConfigWithExitCodes(commands, results) {
+  const lines = [];
 
-  let body = `$ ${result.command}\nexit: ${result.exitCode}`;
-  if (stdout.length > 0) body += `\nstdout:\n${stdout}`;
-  if (stderr.length > 0) body += `\nstderr:\n${stderr}`;
-  return body;
+  for (let i = 0; i < commands.length; i += 1) {
+    const command = commands[i];
+    const exitCode = results[i]?.exitCode;
+    lines.push(`${command} -> ${exitCode ?? "?"}`);
+  }
+
+  return lines.join("\n") || "(empty)";
+}
+
+function collectOutput(results, stream) {
+  return results
+    .map((result) => result[stream] || "")
+    .join("");
 }
 
 function firstLine(text) {
@@ -171,16 +130,12 @@ function renderSystemPromptMessage(message, options, theme) {
  */
 export default function systemPromptExtension(pi) {
   pi.registerMessageRenderer("system-prompt-bootstrap", renderSystemPromptMessage);
-  pi.registerMessageRenderer("system-prompt-file-bootstrap", renderSystemPromptMessage);
 
   // Legacy message tags for backward compatibility.
   pi.registerMessageRenderer("brainjam-bootstrap", renderSystemPromptMessage);
   pi.registerMessageRenderer("bootstrap-brainjam", renderSystemPromptMessage);
-  pi.registerMessageRenderer("brainjam-file-bootstrap", renderSystemPromptMessage);
 
   let cachedConfig = null;
-  let pendingFileCommands = [];
-  let fileCommandsSeeded = false;
   let bootstrapContent = null;
   let bootstrapReady = Promise.resolve();
   let bootstrapPostedForSession = false;
@@ -202,8 +157,6 @@ export default function systemPromptExtension(pi) {
 
       const configResult = await loadConfig(ctx.cwd);
       cachedConfig = configResult.config;
-      pendingFileCommands = [];
-      fileCommandsSeeded = false;
       bootstrapContent = null;
 
       // Run bootstrap only for freshly-created sessions.
@@ -227,16 +180,10 @@ ${looked}`);
           return;
         }
 
-        const immediateCommands = [];
-        for (const cmd of cachedConfig.commands) {
-          if (/\{\{file\}\}|\{file\}/.test(cmd)) pendingFileCommands.push(cmd);
-          else immediateCommands.push(cmd);
-        }
-
         const results = [];
         let timedOut = false;
 
-        for (const line of immediateCommands) {
+        for (const line of cachedConfig.commands) {
           if (timeoutController.signal.aborted) {
             timedOut = true;
             break;
@@ -271,26 +218,21 @@ ${looked}`);
           ? `❌ System Prompt failed${timedOut ? ` (timed out at ${BOOTSTRAP_TIMEOUT_MS}ms)` : ""}${failures > 0 ? ` (${failures} command issue(s))` : ""}`
           : "✅ System Prompt loaded.";
 
-        const blocks = results.length > 0
-          ? results.map(formatCommandResult).join("\n\n---\n\n")
-          : "(no non-file commands to run at session start)";
-
-        const pendingLine = pendingFileCommands.length > 0
-          ? `File-aware commands deferred: ${pendingFileCommands.length} (run when a prompt mentions a file path).`
-          : "File-aware commands deferred: 0";
+        const configWithExitCodes = formatConfigWithExitCodes(
+          cachedConfig.commands,
+          results,
+        );
+        const stdoutContent = collectOutput(results, "stdout");
+        const stderrContent = collectOutput(results, "stderr");
 
         bootstrapContent = `${summary}
 
 Config source: ${cachedConfig.path}
-Prompt file detected: (none at session start)
-${pendingLine}
 
-Config contents:
-${cachedConfig.raw.trim() || "(empty)"}
+${configWithExitCodes}
 
-Captured command run:
-
-${blocks}`;
+# STDOUT
+${stdoutContent}${stderrContent ? `\n\n# STDERR\n${stderrContent}` : ""}`;
 
         await postBootstrap(bootstrapContent);
       } finally {
@@ -299,62 +241,5 @@ ${blocks}`;
     })();
 
     await bootstrapReady;
-  });
-
-  // Deferred {file} commands, executed once when first relevant prompt appears.
-  pi.on("before_agent_start", async (event, ctx) => {
-    await bootstrapReady;
-
-    if (!fileCommandsSeeded && event.messageType === "user" && cachedConfig && pendingFileCommands.length > 0) {
-      const filePath = await findMentionedFile(event.prompt ?? "", ctx.cwd);
-      if (!filePath) return;
-
-      fileCommandsSeeded = true;
-
-      const results = [];
-      for (const line of pendingFileCommands) {
-        const expanded = expandCommand(line, filePath);
-        try {
-          const execResult = await runCommand(pi, expanded);
-          results.push({
-            command: expanded,
-            stdout: execResult.stdout ?? "",
-            stderr: execResult.stderr ?? "",
-            exitCode: execResult.exitCode ?? 0,
-          });
-        } catch (err) {
-          const errorText = err instanceof Error ? err.message : String(err);
-          results.push({
-            command: expanded,
-            stdout: "",
-            stderr: errorText,
-            exitCode: 1,
-          });
-        }
-      }
-
-      const failures = results.filter((r) => r.exitCode !== 0).length;
-      const summary = failures > 0
-        ? `❌ System Prompt failed (${failures} command issue(s))`
-        : "✅ System Prompt loaded.";
-
-      const blocks = results.map(formatCommandResult).join("\n\n---\n\n");
-      const fileContent = `${summary}
-
-Config source: ${cachedConfig.path}
-Prompt file detected: ${filePath}
-
-Captured deferred file-command run:
-
-${blocks}`;
-
-      return {
-        message: {
-          customType: "system-prompt-file-bootstrap",
-          content: fileContent,
-          display: true,
-        },
-      };
-    }
   });
 }
