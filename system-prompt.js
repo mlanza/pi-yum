@@ -200,7 +200,7 @@ function renderSystemPromptMessage(message, options, theme) {
   const fgColor = theme.colors.terminalFg;
   const styled = theme.style(text, { bg: bgColor, fg: fgColor });
 
-  const box = new Box(options.outputPad, 1);
+  const box = new Box(options.outputPad, 0);
   box.addChild(new Text(styled, 0, 0));
   return box;
 }
