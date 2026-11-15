@@ -8,8 +8,9 @@
  * - inject + display exactly what was injected
  */
 
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import process from "node:process";
@@ -45,8 +46,6 @@ function candidateConfigPaths(cwd) {
     // Common user-level config locations.
     path.join(xdg, "system-prompt", ".systempromptrc"),
     path.join(xdg, "system-prompt", "systempromptrc"),
-    path.join(xdg, "brainjam", ".systempromptrc"), // legacy folder name
-    path.join(xdg, "brainjam", "systempromptrc"), // legacy folder name
     path.join(home, ".systempromptrc"),
 
     // Pi-specific fallbacks.
@@ -58,17 +57,26 @@ function candidateConfigPaths(cwd) {
   return unique(candidates.map((p) => path.resolve(p)));
 }
 
-async function loadConfig(cwd) {
-  const candidates = candidateConfigPaths(cwd);
+function selectCandidates(cwd, scope = "all") {
+  const all = candidateConfigPaths(cwd);
+  const local = path.resolve(cwd, ".systempromptrc");
+
+  if (scope === "local") return all.filter((p) => p === local);
+  if (scope === "global") return all.filter((p) => p !== local);
+  return all;
+}
+
+async function loadConfigs(cwd, scope = "all") {
+  const candidates = selectCandidates(cwd, scope);
+  const configs = [];
 
   for (const filePath of candidates) {
     if (!(await existsFile(filePath))) continue;
     const raw = await readFile(filePath, "utf8");
-    const commands = parseCommands(raw);
-    return { config: { path: filePath, raw, commands }, candidates };
+    configs.push({ path: filePath, raw });
   }
 
-  return { config: null, candidates };
+  return { configs, candidates };
 }
 
 function unique(items) {
@@ -81,6 +89,63 @@ function toHomeTilde(filePath) {
   if (resolved === home) return "~";
   if (resolved.startsWith(`${home}${path.sep}`)) return `~${resolved.slice(home.length)}`;
   return filePath;
+}
+
+function makeHashkey(passkey, body) {
+  const digest = createHash("sha256")
+    .update(`${passkey}\n${body}`)
+    .digest("base64")
+    .replace(/[^A-Za-z0-9]/g, "");
+
+  return digest.slice(0, 8);
+}
+
+function readRC(raw, passkey) {
+  const text = String(raw ?? "");
+  const lines = text.split(/\r?\n/);
+  const first = (lines[0] ?? "").trim();
+  const checksumMatch = first.match(/^@([A-Za-z0-9]{8})$/);
+  const checksum = checksumMatch ? checksumMatch[1] : "";
+  const body = checksum ? lines.slice(1).join("\n") : text;
+  const hashkey = passkey ? makeHashkey(passkey, body) : "";
+  const safe = Boolean(checksum && hashkey && checksum === hashkey);
+
+  return {
+    checksum,
+    body,
+    hashkey,
+    safe,
+    commands: parseCommands(body),
+  };
+}
+
+function parseSystemPromptCommandArgs(args) {
+  const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+  const action = tokens[0] ?? "";
+  const flags = new Set(tokens.slice(1));
+
+  if (action !== "grant" && action !== "revoke") {
+    return { error: "Usage: /system-prompt <grant|revoke> [--local|--global]" };
+  }
+
+  const hasLocal = flags.has("--local");
+  const hasGlobal = flags.has("--global");
+  if (hasLocal && hasGlobal) {
+    return { error: "Choose one scope: --local or --global (not both)." };
+  }
+
+  const unknownFlags = [...flags].filter((f) => f !== "--local" && f !== "--global");
+  if (unknownFlags.length > 0) {
+    return { error: `Unknown flag(s): ${unknownFlags.join(", ")}` };
+  }
+
+  const scope = hasLocal ? "local" : hasGlobal ? "global" : "all";
+  return { action, scope };
+}
+
+function serializeRC(body, checksum) {
+  if (!checksum) return body;
+  return body ? `@${checksum}\n${body}` : `@${checksum}`;
 }
 
 async function runCommand(pi, command, signal) {
@@ -112,6 +177,10 @@ function firstLine(text) {
   return String(text || "").split(/\r?\n/, 1)[0] || "system prompt bootstrap";
 }
 
+function formatStdinSection(body) {
+  return `# STDIN\n${body || "(empty)"}`;
+}
+
 function renderSystemPromptMessage(message, options, theme) {
   const content = String(message?.content ?? "");
   const summary = firstLine(content);
@@ -139,18 +208,10 @@ function renderSystemPromptMessage(message, options, theme) {
 export default function systemPromptExtension(pi) {
   pi.registerMessageRenderer("system-prompt-bootstrap", renderSystemPromptMessage);
 
-  // Legacy message tags for backward compatibility.
-  pi.registerMessageRenderer("brainjam-bootstrap", renderSystemPromptMessage);
-  pi.registerMessageRenderer("bootstrap-brainjam", renderSystemPromptMessage);
-
-  let cachedConfig = null;
-  let bootstrapContent = null;
   let bootstrapReady = Promise.resolve();
-  let bootstrapPostedForSession = false;
 
   async function postBootstrap(content) {
-    if (!content || bootstrapPostedForSession) return;
-    bootstrapPostedForSession = true;
+    if (!content) return;
 
     await pi.sendMessage({
       customType: "system-prompt-bootstrap",
@@ -159,13 +220,57 @@ export default function systemPromptExtension(pi) {
     });
   }
 
+  pi.registerCommand("system-prompt", {
+    description: "Grant or revoke system prompt rc checksums",
+    handler: async (args, ctx) => {
+      const parsed = parseSystemPromptCommandArgs(args);
+      if (parsed.error) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+
+      const cwd = ctx.cwd || process.cwd();
+      const { action, scope } = parsed;
+      const configResult = await loadConfigs(cwd, scope);
+      const configs = configResult.configs;
+
+      if (configs.length === 0) {
+        ctx.ui.notify("No matching rc files found.", "warning");
+        return;
+      }
+
+      if (action === "grant") {
+        const passkey = String(process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+        if (!passkey) {
+          ctx.ui.notify("SYSTEMPROMPT_PASSKEY is required for grant.", "error");
+          return;
+        }
+
+        for (const config of configs) {
+          const currentRaw = await readFile(config.path, "utf8");
+          const rc = readRC(currentRaw, passkey);
+          const checksum = makeHashkey(passkey, rc.body);
+          await writeFile(config.path, serializeRC(rc.body, checksum), "utf8");
+        }
+
+        ctx.ui.notify(`Granted ${configs.length} rc file(s).`, "info");
+        return;
+      }
+
+      for (const config of configs) {
+        const currentRaw = await readFile(config.path, "utf8");
+        const rc = readRC(currentRaw, "");
+        await writeFile(config.path, serializeRC(rc.body, ""), "utf8");
+      }
+
+      ctx.ui.notify(`Revoked ${configs.length} rc file(s).`, "info");
+    },
+  });
+
   pi.on("session_start", async (event, ctx) => {
     bootstrapReady = (async () => {
-      bootstrapPostedForSession = false;
-
-      const configResult = await loadConfig(ctx.cwd);
-      cachedConfig = configResult.config;
-      bootstrapContent = null;
+      const configResult = await loadConfigs(ctx.cwd);
+      const configs = configResult.configs;
 
       // Run bootstrap for fresh sessions created via /new and for initial app startup.
       const shouldRunBootstrap = event.reason === "new" || event.reason === "startup";
@@ -173,81 +278,114 @@ export default function systemPromptExtension(pi) {
       // Ignore reload/resume/fork.
       if (!shouldRunBootstrap) return;
 
-      const timeoutController = new AbortController();
-      const timeoutHandle = setTimeout(() => {
-        timeoutController.abort(new Error(`system prompt bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
-      }, BOOTSTRAP_TIMEOUT_MS);
-
-      try {
-        if (!cachedConfig) {
-          const looked = configResult.candidates.map((p) => `- ${toHomeTilde(p)}`).join("\n");
-          await postBootstrap(`❌ System Prompt: no config found (.systempromptrc not loaded).
+      if (configs.length === 0) {
+        const looked = configResult.candidates.map((p) => `- ${toHomeTilde(p)}`).join("\n");
+        await postBootstrap(`❌ .systempromptrc
+No config found.
 
 Checked ${configResult.candidates.length} locations (in order):
 ${looked}`);
-          return;
+        return;
+      }
+
+      const passkey = String(process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+      if (!passkey) {
+        for (const config of configs) {
+          const configPath = toHomeTilde(config.path);
+          const rc = readRC(config.raw, passkey);
+          await postBootstrap(`⚠️ ${configPath}
+Missing SYSTEMPROMPT_PASSKEY. Skipped processing.
+
+${formatStdinSection(rc.body)}`);
         }
+        return;
+      }
+
+      for (const config of configs) {
+        const configPath = toHomeTilde(config.path);
+        const rc = readRC(config.raw, passkey);
+
+        if (!rc.checksum) {
+          await postBootstrap(`🔒 ${configPath}
+Missing checksum line. Expected first line format: @XXXXXXXX
+
+${formatStdinSection(rc.body)}`);
+          continue;
+        }
+
+        if (!rc.safe) {
+          await postBootstrap(`☠️ ${configPath}
+Checksum mismatch. checksum=${rc.checksum} hashkey=${rc.hashkey}
+
+${formatStdinSection(rc.body)}`);
+          continue;
+        }
+
+        const timeoutController = new AbortController();
+        const timeoutHandle = setTimeout(() => {
+          timeoutController.abort(new Error(`system prompt bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
+        }, BOOTSTRAP_TIMEOUT_MS);
 
         const results = [];
         let timedOut = false;
 
-        for (const line of cachedConfig.commands) {
-          if (timeoutController.signal.aborted) {
-            timedOut = true;
-            break;
+        try {
+          for (const line of rc.commands) {
+            if (timeoutController.signal.aborted) {
+              timedOut = true;
+              break;
+            }
+
+            try {
+              const execResult = await runCommand(pi, line, timeoutController.signal);
+              results.push({
+                command: line,
+                stdout: execResult.stdout ?? "",
+                stderr: execResult.stderr ?? "",
+                exitCode: execResult.exitCode ?? 0,
+              });
+            } catch (err) {
+              const errorText = err instanceof Error ? err.message : String(err);
+              const wasTimeout = timeoutController.signal.aborted || /timed out|abort/i.test(errorText);
+              if (wasTimeout) timedOut = true;
+
+              results.push({
+                command: line,
+                stdout: "",
+                stderr: wasTimeout ? `Timed out after ${BOOTSTRAP_TIMEOUT_MS}ms` : errorText,
+                exitCode: wasTimeout ? 124 : 1,
+              });
+
+              if (wasTimeout) break;
+            }
           }
-
-          try {
-            const execResult = await runCommand(pi, line, timeoutController.signal);
-            results.push({
-              command: line,
-              stdout: execResult.stdout ?? "",
-              stderr: execResult.stderr ?? "",
-              exitCode: execResult.exitCode ?? 0,
-            });
-          } catch (err) {
-            const errorText = err instanceof Error ? err.message : String(err);
-            const wasTimeout = timeoutController.signal.aborted || /timed out|abort/i.test(errorText);
-            if (wasTimeout) timedOut = true;
-
-            results.push({
-              command: line,
-              stdout: "",
-              stderr: wasTimeout ? `Timed out after ${BOOTSTRAP_TIMEOUT_MS}ms` : errorText,
-              exitCode: wasTimeout ? 124 : 1,
-            });
-
-            if (wasTimeout) break;
-          }
+        } finally {
+          clearTimeout(timeoutHandle);
         }
 
         const failures = results.filter((r) => r.exitCode !== 0).length;
         const hasFailure = timedOut || failures > 0;
-        const configPath = toHomeTilde(cachedConfig.path);
-        const heading = hasFailure
-          ? `❌ System prompt failed to load from ${configPath}`
-          : `✅ System prompt loaded from ${configPath}`;
+        const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
         const detail = hasFailure
           ? `${timedOut ? `Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms` : ""}${timedOut && failures > 0 ? " " : ""}${failures > 0 ? `${failures} command issue(s)` : ""}`
           : "";
 
         const configWithExitCodes = formatConfigWithExitCodes(
-          cachedConfig.commands,
+          rc.commands,
           results,
         );
         const stdoutContent = collectOutput(results, "stdout");
         const stderrContent = collectOutput(results, "stderr");
+        const statusSection = failures > 0 ? `\n\n# STATUS\n${configWithExitCodes}` : "";
 
-        bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
+        const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}${statusSection}
 
-${configWithExitCodes}
+${formatStdinSection(rc.body)}
 
 # STDOUT
 ${stdoutContent}${stderrContent ? `\n\n# STDERR\n${stderrContent}` : ""}`;
 
         await postBootstrap(bootstrapContent);
-      } finally {
-        clearTimeout(timeoutHandle);
       }
     })();
 
