@@ -206,10 +206,10 @@ export default function systemPromptExtension(pi) {
       fileCommandsSeeded = false;
       bootstrapContent = null;
 
-      // Run full bootstrap for true startup/new sessions.
-      const shouldRunBootstrap = event.reason === "new" || event.reason === "startup";
+      // Run bootstrap only for freshly-created sessions.
+      const shouldRunBootstrap = event.reason === "new";
 
-      // Ignore non-startup session reasons.
+      // Ignore startup/reload/resume/fork.
       if (!shouldRunBootstrap) return;
 
       const timeoutController = new AbortController();
