@@ -1,8 +1,8 @@
 /**
- * brainjam.js — session bootstrap from shell commands.
+ * system-prompt.js — session bootstrap from shell commands.
  *
  * On /new session:
- * - load .brainjamrc
+ * - load .systempromptrc
  * - run commands (one per line) sequentially
  * - capture full stdout/stderr (no custom truncation)
  * - inject + display exactly what was injected
@@ -47,17 +47,19 @@ function candidateConfigPaths(cwd) {
 
   const candidates = [
     // Always check cwd first.
-    path.join(cwd, ".brainjamrc"),
+    path.join(cwd, ".systempromptrc"),
 
     // Common user-level config locations.
-    path.join(xdg, "brainjam", ".brainjamrc"),
-    path.join(xdg, "brainjam", "brainjamrc"),
-    path.join(home, ".brainjamrc"),
+    path.join(xdg, "system-prompt", ".systempromptrc"),
+    path.join(xdg, "system-prompt", "systempromptrc"),
+    path.join(xdg, "brainjam", ".systempromptrc"), // legacy folder name
+    path.join(xdg, "brainjam", "systempromptrc"), // legacy folder name
+    path.join(home, ".systempromptrc"),
 
     // Pi-specific fallbacks.
-    path.join(home, ".pi", "brainjam", ".brainjamrc"),
-    path.join(home, ".pi", "brainjam", "brainjamrc"),
-    path.join(home, ".pi", "agent", "brainjamrc"),
+    path.join(home, ".pi", "system-prompt", ".systempromptrc"),
+    path.join(home, ".pi", "system-prompt", "systempromptrc"),
+    path.join(home, ".pi", "agent", "systempromptrc"),
   ];
 
   return unique(candidates.map((p) => path.resolve(p)));
@@ -140,13 +142,13 @@ function formatCommandResult(result) {
 }
 
 function firstLine(text) {
-  return String(text || "").split(/\r?\n/, 1)[0] || "brainjam bootstrap";
+  return String(text || "").split(/\r?\n/, 1)[0] || "system prompt bootstrap";
 }
 
-function renderBrainjamMessage(message, options, theme) {
+function renderSystemPromptMessage(message, options, theme) {
   const content = String(message?.content ?? "");
   const summary = firstLine(content);
-  let text = `${theme.fg("accent", "[bootstrap-brainjam]")} ${summary}`;
+  let text = `${theme.fg("accent", "[system-prompt]")} ${summary}`;
 
   if (options.expanded) {
     text += `\n\n${content}`;
@@ -167,10 +169,14 @@ function renderBrainjamMessage(message, options, theme) {
 /**
  * @param {import("@earendil-works/pi-coding-agent").ExtensionAPI} pi
  */
-export default function brainjamExtension(pi) {
-  pi.registerMessageRenderer("brainjam-bootstrap", renderBrainjamMessage);
-  pi.registerMessageRenderer("bootstrap-brainjam", renderBrainjamMessage); // legacy tag
-  pi.registerMessageRenderer("brainjam-file-bootstrap", renderBrainjamMessage);
+export default function systemPromptExtension(pi) {
+  pi.registerMessageRenderer("system-prompt-bootstrap", renderSystemPromptMessage);
+  pi.registerMessageRenderer("system-prompt-file-bootstrap", renderSystemPromptMessage);
+
+  // Legacy message tags for backward compatibility.
+  pi.registerMessageRenderer("brainjam-bootstrap", renderSystemPromptMessage);
+  pi.registerMessageRenderer("bootstrap-brainjam", renderSystemPromptMessage);
+  pi.registerMessageRenderer("brainjam-file-bootstrap", renderSystemPromptMessage);
 
   let cachedConfig = null;
   let pendingFileCommands = [];
@@ -184,7 +190,7 @@ export default function brainjamExtension(pi) {
     bootstrapPostedForSession = true;
 
     await pi.sendMessage({
-      customType: "brainjam-bootstrap",
+      customType: "system-prompt-bootstrap",
       content,
       display: true,
     });
@@ -208,13 +214,13 @@ export default function brainjamExtension(pi) {
 
       const timeoutController = new AbortController();
       const timeoutHandle = setTimeout(() => {
-        timeoutController.abort(new Error(`brainjam bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
+        timeoutController.abort(new Error(`system prompt bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
       }, BOOTSTRAP_TIMEOUT_MS);
 
       try {
         if (!cachedConfig) {
           const looked = configResult.candidates.map((p) => `- ${p}`).join("\n");
-          await postBootstrap(`❌ Brainjam: no config found (.brainjamrc not loaded).
+          await postBootstrap(`❌ System Prompt: no config found (.systempromptrc not loaded).
 
 Checked ${configResult.candidates.length} locations (in order):
 ${looked}`);
@@ -262,8 +268,8 @@ ${looked}`);
 
         const failures = results.filter((r) => r.exitCode !== 0).length;
         const summary = timedOut || failures > 0
-          ? `❌ Brainjam failed${timedOut ? ` (timed out at ${BOOTSTRAP_TIMEOUT_MS}ms)` : ""}${failures > 0 ? ` (${failures} command issue(s))` : ""}`
-          : "✅ Brainjam okay";
+          ? `❌ System Prompt failed${timedOut ? ` (timed out at ${BOOTSTRAP_TIMEOUT_MS}ms)` : ""}${failures > 0 ? ` (${failures} command issue(s))` : ""}`
+          : "✅ System Prompt loaded.";
 
         const blocks = results.length > 0
           ? results.map(formatCommandResult).join("\n\n---\n\n")
@@ -329,8 +335,8 @@ ${blocks}`;
 
       const failures = results.filter((r) => r.exitCode !== 0).length;
       const summary = failures > 0
-        ? `❌ Brainjam failed (${failures} command issue(s))`
-        : "✅ Brainjam okay";
+        ? `❌ System Prompt failed (${failures} command issue(s))`
+        : "✅ System Prompt loaded.";
 
       const blocks = results.map(formatCommandResult).join("\n\n---\n\n");
       const fileContent = `${summary}
@@ -344,7 +350,7 @@ ${blocks}`;
 
       return {
         message: {
-          customType: "brainjam-file-bootstrap",
+          customType: "system-prompt-file-bootstrap",
           content: fileContent,
           display: true,
         },
