@@ -123,7 +123,8 @@ For each discovered rc file:
 ### When file is safe
 - Runs commands sequentially with timeout guard
 - Captures stdout/stderr + exit codes
-- Emits per-file success/failure (`✅`/`❌`)
+- Emits `❌` when anything is amiss (timeout, non-zero exit, or stderr output)
+- Emits `✅` only when there are no issues
 
 ---
 
@@ -133,12 +134,12 @@ Per-file bootstrap output is structured for scanability:
 
 - Header line: emoji + rc path
 - Optional detail line (only when needed)
-- `# STATUS` (only when any command exit code is non-zero)
+- `# STATUS` (shown when anything is amiss: timeout, non-zero exit, or stderr output)
 - `# STDIN` (always shown; this is the script body)
 - `# STDOUT`
 - `# STDERR` (only when non-empty)
 
-`# STATUS` is intentionally hidden for all-zero runs to reduce noise.
+`# STATUS` is hidden only when there are no issues.
 
 ---
 

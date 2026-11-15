@@ -364,19 +364,25 @@ ${formatStdinSection(rc.body)}`);
         }
 
         const failures = results.filter((r) => r.exitCode !== 0).length;
-        const hasFailure = timedOut || failures > 0;
-        const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
-        const detail = hasFailure
-          ? `${timedOut ? `Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms` : ""}${timedOut && failures > 0 ? " " : ""}${failures > 0 ? `${failures} command issue(s)` : ""}`
-          : "";
-
         const configWithExitCodes = formatConfigWithExitCodes(
           rc.commands,
           results,
         );
         const stdoutContent = collectOutput(results, "stdout");
         const stderrContent = collectOutput(results, "stderr");
-        const statusSection = failures > 0 ? `\n\n# STATUS\n${configWithExitCodes}` : "";
+        const hasStderr = stderrContent.trim().length > 0;
+        const hasIssue = timedOut || failures > 0 || hasStderr;
+        const heading = `${hasIssue ? "❌" : "✅"} ${configPath}`;
+
+        const detailParts = [];
+        if (timedOut) detailParts.push(`Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms`);
+        if (failures > 0) detailParts.push(`${failures} command issue(s)`);
+        if (hasStderr) detailParts.push("stderr output detected");
+        const detail = detailParts.join(" • ");
+
+        const statusSection = hasIssue
+          ? `\n\n# STATUS\n${configWithExitCodes}${hasStderr && failures === 0 && !timedOut ? "\nstderr present with zero exit code(s)" : ""}`
+          : "";
 
         const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}${statusSection}
 
