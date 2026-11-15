@@ -58,6 +58,14 @@ On session start, the extension checks rc locations in order, but only executes 
 
 It intentionally skips bootstrap when pi is launched with continue mode (`pi -c` / `--continue`), and also skips on `resume`, `fork`, and `reload`.
 
+You can disable the extension for a run with:
+
+```sh
+pi --no-system-prompt
+```
+
+When this flag is present, the extension does not wire up its renderer, command, or bootstrap session hook.
+
 When bootstrap is eligible, it checks rc locations in order:
 
 1. `./.systempromptrc` (cwd local)

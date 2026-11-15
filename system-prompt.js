@@ -152,6 +152,23 @@ function launchedWithContinueFlag(argv = process.argv) {
   return false;
 }
 
+function launchedWithNoSystemPromptFlag(argv = process.argv) {
+  const args = Array.isArray(argv) ? argv.slice(2) : [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "--no-system-prompt") return true;
+    if (arg.startsWith("--system-prompt=") && arg.slice("--system-prompt=".length) === "false") return true;
+
+    if (arg === "--system-prompt") {
+      const next = args[i + 1] ?? "";
+      if (next === "false") return true;
+    }
+  }
+
+  return false;
+}
+
 async function runCommand(pi, command, signal) {
   if (process.platform === "win32") {
     return pi.exec("cmd", ["/d", "/s", "/c", command], { signal });
@@ -193,6 +210,14 @@ function renderSystemPromptMessage(message, options, theme) {
  * @param {import("@earendil-works/pi-coding-agent").ExtensionAPI} pi
  */
 export default function systemPromptExtension(pi) {
+  pi.registerFlag("no-system-prompt", {
+    description: "Disable trusted .systempromptrc bootstrap execution",
+    type: "boolean",
+    default: false,
+  });
+
+  if (launchedWithNoSystemPromptFlag()) return;
+
   pi.registerMessageRenderer("system-prompt-bootstrap", renderSystemPromptMessage);
 
   let bootstrapReady = Promise.resolve();
