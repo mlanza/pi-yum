@@ -87,8 +87,8 @@ cmd.js help
 Rules:
 - First line should be checksum: `@` + 8 alnum chars
 - Body is everything after first line when checksum exists
-- Body lines are parsed as commands
-- Empty lines and `#` comment lines are ignored
+- Body is executed as one shell script (`sh -lc`) with one process exit code
+- Nothing is pre-parsed line-by-line by the extension
 
 ---
 
@@ -101,7 +101,6 @@ For each discovered rc file:
    - `body`
    - `hashkey` (computed)
    - `safe` (bool: `checksum === hashkey`)
-   - `commands`
 2. `hashkey` is first 8 chars of a SHA-derived digest of:
    - `SYSTEMPROMPT_PASSKEY + "\n" + body`
 3. Execute only when `safe === true`
@@ -118,19 +117,20 @@ For each discovered rc file:
 - Skips execution for all files
 
 ### When checksum line is missing
-- Emits per-file notice (`🧾`)
+- Emits per-file notice (`🔒`)
 - Skips execution for that file
 
 ### When checksum mismatches computed hash
-- Emits per-file lock notice (`🔒`)
+- Emits per-file mismatch notice (`☠️`)
 - Includes both `checksum` and computed `hashkey`
 - Skips execution for that file
 
 ### When file is safe
-- Runs commands sequentially with timeout guard
-- Captures stdout/stderr + exit codes
-- Emits `❌` when anything is amiss (timeout, non-zero exit, or stderr output)
-- Emits `✅` only when there are no issues
+- Runs the full rc body as a single shell script with timeout guard
+- Captures stdout/stderr and one script exit code
+- Emits `❌` when exit code is non-zero (including timeout)
+- Emits `✅` when exit code is zero
+- `stderr` is shown when present, but by itself does not force failure
 
 ---
 
@@ -139,13 +139,10 @@ For each discovered rc file:
 Per-file bootstrap output is structured for scanability:
 
 - Header line: emoji + rc path
-- Optional detail line (only when needed)
-- `# STATUS` (shown when anything is amiss: timeout, non-zero exit, or stderr output)
+- Optional detail line (shown on failure; includes exit code)
 - `# STDIN` (always shown; this is the script body)
 - `# STDOUT`
 - `# STDERR` (only when non-empty)
-
-`# STATUS` is hidden only when there are no issues.
 
 ---
 
@@ -176,6 +173,45 @@ Scopes:
 Re-reading at command time avoids stale in-memory assumptions.
 
 ---
+
+## Exit code strategy: first failure vs aggregate
+
+Because rc is now executed as one script, you control failure policy in the script itself.
+
+### Stop on first failure (strict)
+Add strict mode in rc when you want an immediate stop:
+
+```sh
+set -eu
+set -o pipefail
+# commands...
+```
+
+Notes:
+- `pipefail` is shell-dependent; this runner uses `sh -lc`.
+- On shells that do not support `pipefail`, that line will error; if needed, guard it or avoid it.
+
+### Continue and track your own status (lenient)
+If you want to keep going and decide final success yourself, capture return codes and `exit` at the end.
+
+```sh
+status=0
+cmd_a || status=$?
+cmd_b || status=$?
+cmd_c || status=$?
+exit "$status"
+```
+
+You can also keep the first failure specifically:
+
+```sh
+status=0
+cmd_a || [ "$status" -ne 0 ] || status=$?
+cmd_b || [ "$status" -ne 0 ] || status=$?
+exit "$status"
+```
+
+This gives deliberate control: fail-fast when important, or run through and summarize.
 
 ## Operational guidance
 

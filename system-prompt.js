@@ -3,7 +3,7 @@
  *
  * On fresh startup or /new session:
  * - load .systempromptrc
- * - run commands (one per line) sequentially
+ * - run the full rc body as one shell script
  * - capture full stdout/stderr (no custom truncation)
  * - inject + display exactly what was injected
  */
@@ -25,13 +25,6 @@ async function existsFile(filePath) {
   } catch {
     return false;
   }
-}
-
-function parseCommands(content) {
-  return content
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#"));
 }
 
 function candidateConfigPaths(cwd) {
@@ -115,7 +108,6 @@ function readRC(raw, passkey) {
     body,
     hashkey,
     safe,
-    commands: parseCommands(body),
   };
 }
 
@@ -167,23 +159,6 @@ async function runCommand(pi, command, signal) {
   return pi.exec("sh", ["-lc", command], { signal });
 }
 
-function formatConfigWithExitCodes(commands, results) {
-  const lines = [];
-
-  for (let i = 0; i < commands.length; i += 1) {
-    const command = commands[i];
-    const exitCode = results[i]?.exitCode;
-    lines.push(`${command} -> ${exitCode ?? "?"}`);
-  }
-
-  return lines.join("\n") || "(empty)";
-}
-
-function collectOutput(results, stream) {
-  return results
-    .map((result) => result[stream] || "")
-    .join("");
-}
 
 function firstLine(text) {
   return String(text || "").split(/\r?\n/, 1)[0] || "system prompt bootstrap";
@@ -339,65 +314,35 @@ ${formatStdinSection(rc.body)}`);
           timeoutController.abort(new Error(`system prompt bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
         }, BOOTSTRAP_TIMEOUT_MS);
 
-        const results = [];
+        let exitCode = 0;
+        let stdoutContent = "";
+        let stderrContent = "";
         let timedOut = false;
 
         try {
-          for (const line of rc.commands) {
-            if (timeoutController.signal.aborted) {
-              timedOut = true;
-              break;
-            }
-
-            try {
-              const execResult = await runCommand(pi, line, timeoutController.signal);
-              results.push({
-                command: line,
-                stdout: execResult.stdout ?? "",
-                stderr: execResult.stderr ?? "",
-                exitCode: execResult.exitCode ?? 0,
-              });
-            } catch (err) {
-              const errorText = err instanceof Error ? err.message : String(err);
-              const wasTimeout = timeoutController.signal.aborted || /timed out|abort/i.test(errorText);
-              if (wasTimeout) timedOut = true;
-
-              results.push({
-                command: line,
-                stdout: "",
-                stderr: wasTimeout ? `Timed out after ${BOOTSTRAP_TIMEOUT_MS}ms` : errorText,
-                exitCode: wasTimeout ? 124 : 1,
-              });
-
-              if (wasTimeout) break;
-            }
-          }
+          const execResult = await runCommand(pi, rc.body, timeoutController.signal);
+          exitCode = execResult.exitCode ?? 0;
+          stdoutContent = execResult.stdout ?? "";
+          stderrContent = execResult.stderr ?? "";
+        } catch (err) {
+          const errorText = err instanceof Error ? err.message : String(err);
+          const wasTimeout = timeoutController.signal.aborted || /timed out|abort/i.test(errorText);
+          timedOut = wasTimeout;
+          exitCode = wasTimeout ? 124 : 1;
+          stderrContent = wasTimeout ? `Timed out after ${BOOTSTRAP_TIMEOUT_MS}ms` : errorText;
         } finally {
           clearTimeout(timeoutHandle);
         }
 
-        const failures = results.filter((r) => r.exitCode !== 0).length;
-        const configWithExitCodes = formatConfigWithExitCodes(
-          rc.commands,
-          results,
-        );
-        const stdoutContent = collectOutput(results, "stdout");
-        const stderrContent = collectOutput(results, "stderr");
-        const hasStderr = stderrContent.trim().length > 0;
-        const hasIssue = timedOut || failures > 0 || hasStderr;
-        const heading = `${hasIssue ? "❌" : "✅"} ${configPath}`;
+        const hasFailure = exitCode !== 0;
+        const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
+        const detail = timedOut
+          ? `exit code ${exitCode} • Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms`
+          : hasFailure
+            ? `exit code ${exitCode}`
+            : "";
 
-        const detailParts = [];
-        if (timedOut) detailParts.push(`Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms`);
-        if (failures > 0) detailParts.push(`${failures} command issue(s)`);
-        if (hasStderr) detailParts.push("stderr output detected");
-        const detail = detailParts.join(" • ");
-
-        const statusSection = hasIssue
-          ? `\n\n# STATUS\n${configWithExitCodes}${hasStderr && failures === 0 && !timedOut ? "\nstderr present with zero exit code(s)" : ""}`
-          : "";
-
-        const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}${statusSection}
+        const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
 
 ${formatStdinSection(rc.body)}
 
