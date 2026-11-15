@@ -52,7 +52,13 @@ This is a practical “signed script body” pattern for local bootstrap scripts
 
 ## Discovery and boot order
 
-On session start (`reason: new` or `startup`), the extension checks rc locations in order:
+On session start, the extension checks rc locations in order, but only executes bootstrap for:
+- `reason: new`
+- `reason: startup` when launch is **not** continue mode
+
+It intentionally skips bootstrap when pi is launched with continue mode (`pi -c` / `--continue`), and also skips on `resume`, `fork`, and `reload`.
+
+When bootstrap is eligible, it checks rc locations in order:
 
 1. `./.systempromptrc` (cwd local)
 2. `$XDG_CONFIG_HOME/system-prompt/.systempromptrc`

@@ -1,7 +1,7 @@
 /**
  * system-prompt.js — session bootstrap from shell commands.
  *
- * On /new session:
+ * On fresh startup or /new session:
  * - load .systempromptrc
  * - run commands (one per line) sequentially
  * - capture full stdout/stderr (no custom truncation)
@@ -148,6 +148,18 @@ function serializeRC(body, checksum) {
   return body ? `@${checksum}\n${body}` : `@${checksum}`;
 }
 
+function launchedWithContinueFlag(argv = process.argv) {
+  const args = Array.isArray(argv) ? argv.slice(2) : [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? "";
+    if (arg === "-c" || arg === "--continue") return true;
+    if (arg.startsWith("--continue=")) return true;
+  }
+
+  return false;
+}
+
 async function runCommand(pi, command, signal) {
   if (process.platform === "win32") {
     return pi.exec("cmd", ["/d", "/s", "/c", command], { signal });
@@ -272,10 +284,11 @@ export default function systemPromptExtension(pi) {
       const configResult = await loadConfigs(ctx.cwd);
       const configs = configResult.configs;
 
-      // Run bootstrap for fresh sessions created via /new and for initial app startup.
-      const shouldRunBootstrap = event.reason === "new" || event.reason === "startup";
+      // Run bootstrap for /new and startup launches, except when launched with continue mode (`pi -c`).
+      const continuedLaunch = launchedWithContinueFlag();
+      const shouldRunBootstrap = event.reason === "new" || (event.reason === "startup" && !continuedLaunch);
 
-      // Ignore reload/resume/fork.
+      // Ignore reload/resume/fork and startup with continue mode.
       if (!shouldRunBootstrap) return;
 
       if (configs.length === 0) {
