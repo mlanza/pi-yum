@@ -38,38 +38,35 @@ function candidateConfigPaths(cwd) {
 
     // Common user-level config locations.
     path.join(xdg, "system-prompt", ".systempromptrc"),
-    path.join(xdg, "system-prompt", "systempromptrc"),
     path.join(home, ".systempromptrc"),
 
     // Pi-specific fallbacks.
     path.join(home, ".pi", "system-prompt", ".systempromptrc"),
-    path.join(home, ".pi", "system-prompt", "systempromptrc"),
-    path.join(home, ".pi", "agent", "systempromptrc"),
+    path.join(home, ".pi", "agent", ".systempromptrc"),
   ];
 
   return unique(candidates.map((p) => path.resolve(p)));
 }
 
-function selectCandidates(cwd, scope = "all") {
-  const all = candidateConfigPaths(cwd);
+function inScope(filePath, cwd, scope = "all") {
   const local = path.resolve(cwd, ".systempromptrc");
-
-  if (scope === "local") return all.filter((p) => p === local);
-  if (scope === "global") return all.filter((p) => p !== local);
-  return all;
+  if (scope === "local") return filePath === local;
+  if (scope === "global") return filePath !== local;
+  return true;
 }
 
-async function loadConfigs(cwd, scope = "all") {
-  const candidates = selectCandidates(cwd, scope);
-  const configs = [];
+async function locateConfigs(cwd, scope = "all") {
+  const candidates = candidateConfigPaths(cwd).filter((filePath) => inScope(filePath, cwd, scope));
+  const files = [];
 
   for (const filePath of candidates) {
-    if (!(await existsFile(filePath))) continue;
-    const raw = await readFile(filePath, "utf8");
-    configs.push({ path: filePath, raw });
+    const exists = await existsFile(filePath);
+    const raw = exists ? await readFile(filePath, "utf8") : "";
+    files.push({ path: filePath, exists, raw });
   }
 
-  return { configs, candidates };
+  const configs = files.filter((file) => file.exists).map((file) => ({ path: file.path, raw: file.raw }));
+  return { candidates, files, configs };
 }
 
 function unique(items) {
@@ -116,8 +113,8 @@ function parseSystemPromptCommandArgs(args) {
   const action = tokens[0] ?? "";
   const flags = new Set(tokens.slice(1));
 
-  if (action !== "grant" && action !== "revoke") {
-    return { error: "Usage: /system-prompt <grant|revoke> [--local|--global]" };
+  if (action !== "grant" && action !== "revoke" && action !== "locate") {
+    return { error: "Usage: /system-prompt <grant|revoke|locate> [--local|--global]" };
   }
 
   const hasLocal = flags.has("--local");
@@ -249,7 +246,7 @@ export default function systemPromptExtension(pi) {
   }
 
   pi.registerCommand("system-prompt", {
-    description: "Grant or revoke system prompt rc checksums",
+    description: "Grant, revoke, or locate .systempromptrc files",
     handler: async (args, ctx) => {
       const parsed = parseSystemPromptCommandArgs(args);
       if (parsed.error) {
@@ -259,8 +256,18 @@ export default function systemPromptExtension(pi) {
 
       const cwd = ctx.cwd || process.cwd();
       const { action, scope } = parsed;
-      const configResult = await loadConfigs(cwd, scope);
+      const configResult = await locateConfigs(cwd, scope);
       const configs = configResult.configs;
+
+      if (action === "locate") {
+        const lines = configResult.files.map((file) => {
+          const marker = file.exists ? "✅" : "•";
+          return `${marker} ${toHomeTilde(file.path)}`;
+        });
+        const detail = configs.length === 0 ? "\n\nNo config found." : "";
+        ctx.ui.notify(`Lookup order (${scope}):\n${lines.join("\n")}${detail}`, "info");
+        return;
+      }
 
       if (configs.length === 0) {
         ctx.ui.notify("No matching rc files found.", "warning");
@@ -297,7 +304,7 @@ export default function systemPromptExtension(pi) {
 
   pi.on("session_start", async (event, ctx) => {
     bootstrapReady = (async () => {
-      const configResult = await loadConfigs(ctx.cwd);
+      const configResult = await locateConfigs(ctx.cwd);
       const configs = configResult.configs;
 
       // Run bootstrap for /new and startup launches, except when launched with continue mode (`pi -c`).
@@ -307,15 +314,7 @@ export default function systemPromptExtension(pi) {
       // Ignore reload/resume/fork and startup with continue mode.
       if (!shouldRunBootstrap) return;
 
-      if (configs.length === 0) {
-        const looked = configResult.candidates.map((p) => `- ${toHomeTilde(p)}`).join("\n");
-        await postBootstrap(`❌ .systempromptrc
-No config found.
-
-Checked ${configResult.candidates.length} locations (in order):
-${looked}`);
-        return;
-      }
+      if (configs.length === 0) return;
 
       const passkey = String(process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
       if (!passkey) {
