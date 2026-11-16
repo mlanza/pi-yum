@@ -181,8 +181,23 @@ function firstLine(text) {
   return String(text || "").split(/\r?\n/, 1)[0] || "system prompt bootstrap";
 }
 
-function formatStdinSection(body) {
-  return `# STDIN\n${body || "(empty)"}`;
+function trimTrailingBlankLines(text) {
+  return String(text ?? "").replace(/(?:\r?\n[\t ]*)+$/u, "");
+}
+
+function withFinalBlankLine(text) {
+  const trimmed = trimTrailingBlankLines(text);
+  return trimmed ? `${trimmed}\n\n` : "";
+}
+
+function formatScriptSection(body) {
+  return trimTrailingBlankLines(body);
+}
+
+function formatPromptSection(stdout, stderr) {
+  const out = trimTrailingBlankLines(stdout);
+  const err = trimTrailingBlankLines(stderr);
+  return [out, err].filter(Boolean).join("\n\n");
 }
 
 function renderSystemPromptMessage(message, options, theme) {
@@ -223,11 +238,12 @@ export default function systemPromptExtension(pi) {
   let bootstrapReady = Promise.resolve();
 
   async function postBootstrap(content) {
-    if (!content) return;
+    const normalized = withFinalBlankLine(content);
+    if (!normalized) return;
 
     await pi.sendMessage({
       customType: "system-prompt-bootstrap",
-      content,
+      content: normalized,
       display: true,
     });
   }
@@ -309,7 +325,7 @@ ${looked}`);
           await postBootstrap(`⚠️ ${configPath}
 Missing SYSTEMPROMPT_PASSKEY. Skipped processing.
 
-${formatStdinSection(rc.body)}`);
+${formatScriptSection(rc.body)}`);
         }
         return;
       }
@@ -322,7 +338,7 @@ ${formatStdinSection(rc.body)}`);
           await postBootstrap(`🔒 ${configPath}
 Missing checksum line. Expected first line format: @XXXXXXXX
 
-${formatStdinSection(rc.body)}`);
+${formatScriptSection(rc.body)}`);
           continue;
         }
 
@@ -330,7 +346,7 @@ ${formatStdinSection(rc.body)}`);
           await postBootstrap(`☠️ ${configPath}
 Checksum mismatch. checksum=${rc.checksum} hashkey=${rc.hashkey}
 
-${formatStdinSection(rc.body)}`);
+${formatScriptSection(rc.body)}`);
           continue;
         }
 
@@ -367,12 +383,16 @@ ${formatStdinSection(rc.body)}`);
             ? `exit code ${exitCode}`
             : "";
 
+        const scriptSection = formatScriptSection(rc.body);
+        const promptSection = formatPromptSection(stdoutContent, stderrContent);
+
         const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
 
-${formatStdinSection(rc.body)}
+${scriptSection}
 
-# STDOUT
-${stdoutContent}${stderrContent ? `\n\n# STDERR\n${stderrContent}` : ""}`;
+↓↓↓
+
+${promptSection}`;
 
         await postBootstrap(bootstrapContent);
       }
