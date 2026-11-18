@@ -1,8 +1,8 @@
 /**
- * system-prompt.js — session bootstrap from shell commands.
+ * session-boot.js — session bootstrap from shell commands.
  *
  * On fresh startup or /new session:
- * - load .systempromptrc
+ * - load .sessionbootrc
  * - run the full rc body as one shell script
  * - capture full stdout/stderr (no custom truncation)
  * - inject + display exactly what was injected
@@ -16,7 +16,7 @@ import os from "node:os";
 import process from "node:process";
 import { Box, Text } from "@earendil-works/pi-tui";
 
-const BOOTSTRAP_TIMEOUT_MS = 10_000;
+const BOOT_TIMEOUT_MS = 10_000;
 
 async function existsFile(filePath) {
   try {
@@ -34,22 +34,22 @@ function candidateConfigPaths(cwd) {
 
   const candidates = [
     // Always check cwd first.
-    path.join(cwd, ".systempromptrc"),
+    path.join(cwd, ".sessionbootrc"),
 
     // Common user-level config locations.
-    path.join(xdg, "system-prompt", ".systempromptrc"),
-    path.join(home, ".systempromptrc"),
+    path.join(xdg, "session-boot", ".sessionbootrc"),
+    path.join(home, ".sessionbootrc"),
 
     // Pi-specific fallbacks.
-    path.join(home, ".pi", "system-prompt", ".systempromptrc"),
-    path.join(home, ".pi", "agent", ".systempromptrc"),
+    path.join(home, ".pi", "session-boot", ".sessionbootrc"),
+    path.join(home, ".pi", "agent", ".sessionbootrc"),
   ];
 
   return unique(candidates.map((p) => path.resolve(p)));
 }
 
 function inScope(filePath, cwd, scope = "all") {
-  const local = path.resolve(cwd, ".systempromptrc");
+  const local = path.resolve(cwd, ".sessionbootrc");
   if (scope === "local") return filePath === local;
   if (scope === "global") return filePath !== local;
   return true;
@@ -108,13 +108,13 @@ function readRC(raw, passkey) {
   };
 }
 
-function parseSystemPromptCommandArgs(args) {
+function parseSessionBootCommandArgs(args) {
   const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
   const action = tokens[0] ?? "";
   const flags = new Set(tokens.slice(1));
 
   if (action !== "grant" && action !== "revoke" && action !== "locate") {
-    return { error: "Usage: /system-prompt <grant|revoke|locate> [--local|--global]" };
+    return { error: "Usage: /session-boot <grant|revoke|locate> [--local|--global]" };
   }
 
   const hasLocal = flags.has("--local");
@@ -149,15 +149,15 @@ function launchedWithContinueFlag(argv = process.argv) {
   return false;
 }
 
-function launchedWithNoSystemPromptFlag(argv = process.argv) {
+function launchedWithNoSessionBootFlag(argv = process.argv) {
   const args = Array.isArray(argv) ? argv.slice(2) : [];
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] ?? "";
-    if (arg === "--no-system-prompt") return true;
-    if (arg.startsWith("--system-prompt=") && arg.slice("--system-prompt=".length) === "false") return true;
+    if (arg === "--no-session-boot") return true;
+    if (arg.startsWith("--session-boot=") && arg.slice("--session-boot=".length) === "false") return true;
 
-    if (arg === "--system-prompt") {
+    if (arg === "--session-boot") {
       const next = args[i + 1] ?? "";
       if (next === "false") return true;
     }
@@ -175,7 +175,7 @@ async function runCommand(pi, command, signal) {
 
 
 function firstLine(text) {
-  return String(text || "").split(/\r?\n/, 1)[0] || "system prompt bootstrap";
+  return String(text || "").split(/\r?\n/, 1)[0] || "session boot";
 }
 
 function trimTrailingBlankLines(text) {
@@ -197,10 +197,10 @@ function formatPromptSection(stdout, stderr) {
   return [out, err].filter(Boolean).join("\n\n");
 }
 
-function renderSystemPromptMessage(message, options, theme) {
+function renderSessionBootMessage(message, options, theme) {
   const content = String(message?.content ?? "");
   const summary = firstLine(content);
-  let text = `${theme.fg("accent", "[system-prompt]")} ${summary}`;
+  let text = `${theme.fg("accent", "[session-boot]")} ${summary}`;
 
   if (options.expanded) {
     text += `\n\n${content}`;
@@ -221,16 +221,18 @@ function renderSystemPromptMessage(message, options, theme) {
 /**
  * @param {import("@earendil-works/pi-coding-agent").ExtensionAPI} pi
  */
-export default function systemPromptExtension(pi) {
-  pi.registerFlag("no-system-prompt", {
-    description: "Disable trusted .systempromptrc bootstrap execution",
+export default function sessionBootExtension(pi) {
+  pi.registerFlag("no-session-boot", {
+    description: "Disable trusted .sessionbootrc bootstrap execution",
     type: "boolean",
     default: false,
   });
 
-  if (launchedWithNoSystemPromptFlag()) return;
+  if (launchedWithNoSessionBootFlag()) return;
 
-  pi.registerMessageRenderer("system-prompt-bootstrap", renderSystemPromptMessage);
+  pi.registerMessageRenderer("session-boot-bootstrap", renderSessionBootMessage);
+  // Keep reports in existing sessions readable after the rename.
+  pi.registerMessageRenderer("system-prompt-bootstrap", renderSessionBootMessage);
 
   let bootstrapReady = Promise.resolve();
 
@@ -239,16 +241,16 @@ export default function systemPromptExtension(pi) {
     if (!normalized) return;
 
     await pi.sendMessage({
-      customType: "system-prompt-bootstrap",
+      customType: "session-boot-bootstrap",
       content: normalized,
       display: true,
     });
   }
 
-  pi.registerCommand("system-prompt", {
-    description: "Grant, revoke, or locate .systempromptrc files",
+  pi.registerCommand("session-boot", {
+    description: "Grant, revoke, or locate .sessionbootrc files",
     handler: async (args, ctx) => {
-      const parsed = parseSystemPromptCommandArgs(args);
+      const parsed = parseSessionBootCommandArgs(args);
       if (parsed.error) {
         ctx.ui.notify(parsed.error, "error");
         return;
@@ -275,9 +277,9 @@ export default function systemPromptExtension(pi) {
       }
 
       if (action === "grant") {
-        const passkey = String(process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+        const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
         if (!passkey) {
-          ctx.ui.notify("SYSTEMPROMPT_PASSKEY is required for grant.", "error");
+          ctx.ui.notify("SESSIONBOOT_PASSKEY is required for grant (SYSTEMPROMPT_PASSKEY also supported).", "error");
           return;
         }
 
@@ -316,13 +318,13 @@ export default function systemPromptExtension(pi) {
 
       if (configs.length === 0) return;
 
-      const passkey = String(process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+      const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
       if (!passkey) {
         for (const config of configs) {
           const configPath = toHomeTilde(config.path);
           const rc = readRC(config.raw, passkey);
           await postBootstrap(`⚠️ ${configPath}
-Missing SYSTEMPROMPT_PASSKEY. Skipped processing.
+Missing SESSIONBOOT_PASSKEY (or legacy SYSTEMPROMPT_PASSKEY). Skipped processing.
 
 ${formatScriptSection(rc.body)}`);
         }
@@ -351,8 +353,8 @@ ${formatScriptSection(rc.body)}`);
 
         const timeoutController = new AbortController();
         const timeoutHandle = setTimeout(() => {
-          timeoutController.abort(new Error(`system prompt bootstrap timed out after ${BOOTSTRAP_TIMEOUT_MS}ms`));
-        }, BOOTSTRAP_TIMEOUT_MS);
+          timeoutController.abort(new Error(`session boot timed out after ${BOOT_TIMEOUT_MS}ms`));
+        }, BOOT_TIMEOUT_MS);
 
         let exitCode = 0;
         let stdoutContent = "";
@@ -369,7 +371,7 @@ ${formatScriptSection(rc.body)}`);
           const wasTimeout = timeoutController.signal.aborted || /timed out|abort/i.test(errorText);
           timedOut = wasTimeout;
           exitCode = wasTimeout ? 124 : 1;
-          stderrContent = wasTimeout ? `Timed out after ${BOOTSTRAP_TIMEOUT_MS}ms` : errorText;
+          stderrContent = wasTimeout ? `Timed out after ${BOOT_TIMEOUT_MS}ms` : errorText;
         } finally {
           clearTimeout(timeoutHandle);
         }
@@ -377,7 +379,7 @@ ${formatScriptSection(rc.body)}`);
         const hasFailure = exitCode !== 0;
         const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
         const detail = timedOut
-          ? `exit code ${exitCode} • Timed out at ${BOOTSTRAP_TIMEOUT_MS}ms`
+          ? `exit code ${exitCode} • Timed out at ${BOOT_TIMEOUT_MS}ms`
           : hasFailure
             ? `exit code ${exitCode}`
             : "";
