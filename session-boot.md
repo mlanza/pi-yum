@@ -39,7 +39,7 @@ Trust is enforced by:
 
 If verification fails, commands do not run.
 
-`SYSTEMPROMPT_PASSKEY` remains supported as a legacy fallback. Renaming the rc files does not change their contents or invalidate their checksums.
+Only `SESSIONBOOT_PASSKEY` is used. Renaming the rc files does not change their contents or invalidate their checksums, provided the passkey value stays the same.
 
 ### Security intent
 

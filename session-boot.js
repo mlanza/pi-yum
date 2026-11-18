@@ -277,9 +277,9 @@ export default function sessionBootExtension(pi) {
       }
 
       if (action === "grant") {
-        const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+        const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? "").trim();
         if (!passkey) {
-          ctx.ui.notify("SESSIONBOOT_PASSKEY is required for grant (SYSTEMPROMPT_PASSKEY also supported).", "error");
+          ctx.ui.notify("SESSIONBOOT_PASSKEY is required for grant.", "error");
           return;
         }
 
@@ -318,13 +318,13 @@ export default function sessionBootExtension(pi) {
 
       if (configs.length === 0) return;
 
-      const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? process.env.SYSTEMPROMPT_PASSKEY ?? "").trim();
+      const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? "").trim();
       if (!passkey) {
         for (const config of configs) {
           const configPath = toHomeTilde(config.path);
           const rc = readRC(config.raw, passkey);
           await postBootstrap(`⚠️ ${configPath}
-Missing SESSIONBOOT_PASSKEY (or legacy SYSTEMPROMPT_PASSKEY). Skipped processing.
+Missing SESSIONBOOT_PASSKEY. Skipped processing.
 
 ${formatScriptSection(rc.body)}`);
         }
