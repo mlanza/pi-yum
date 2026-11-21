@@ -34,7 +34,7 @@ To reduce accidental or malicious execution, each rc file must be explicitly tru
 
 Trust is enforced by:
 1. A required env secret: `SESSIONBOOT_PASSKEY`
-2. A checksum line in each rc file: `@XXXXXXXX`
+2. Exactly one checksum comment anywhere in each rc file: `#checksum: XXXXXXXX`
 3. Verification that checksum matches file body + passkey-derived hash
 
 If verification fails, commands do not run.
@@ -85,18 +85,22 @@ It loads and processes **all existing matches**.
 
 Expected format:
 
-```text
-@ji349dfH
+```bash
+#!/usr/bin/env bash
+#checksum: ji349dfH
 # comments allowed
 echo "hello"
 cmd.js help
 ```
 
 Rules:
-- First line should be checksum: `@` + 8 alnum chars
-- Body is everything after first line when checksum exists
-- Body is executed as one shell script (`sh -lc`) with one process exit code
-- Nothing is pre-parsed line-by-line by the extension
+- Exactly one standalone checksum comment is required: `#checksum: ` + 8 alnum chars
+- The checksum comment can appear anywhere in the file
+- The hash body is the whole file with that comment line (including its line ending) omitted; all other content and line endings are preserved
+- The whole original file, including the shebang and checksum, is executed with `bash -lc`
+- File text shown to Pi omits the checksum comment line but preserves the shebang and all other content
+- Bash must be available on `PATH`, including on Windows; the shebang does not select a different interpreter
+- Missing, malformed, or duplicate checksums prevent execution
 
 ---
 
@@ -105,8 +109,8 @@ Rules:
 For each discovered rc file:
 
 1. Parse with `readRC(raw, passkey)` into:
-   - `checksum` (from first line, without `@`)
-   - `body`
+   - `checksum` (value extracted from the checksum comment anywhere in the file)
+   - `body` (file with the checksum comment line omitted, used for hashing, display, and trust-marker updates)
    - `hashkey` (computed)
    - `safe` (bool: `checksum === hashkey`)
 2. `hashkey` is first 8 chars of a SHA-derived digest of:
@@ -134,7 +138,7 @@ For each discovered rc file:
 - Skips execution for that file
 
 ### When file is safe
-- Runs the full rc body as a single shell script with timeout guard
+- Runs the full original rc file, including its checksum comment, as a single Bash script with timeout guard
 - Captures stdout/stderr and one script exit code
 - Emits `❌` when exit code is non-zero (including timeout)
 - Emits `✅` when exit code is zero
@@ -148,7 +152,7 @@ Per-file bootstrap output is structured for scanability:
 
 - Header line: emoji + rc path
 - Optional detail line (shown on failure; includes exit code)
-- Script body
+- Script with the checksum comment line omitted; shebang and other original whitespace are preserved
 - `↓↓↓` separator
 - Command output, followed by stderr when non-empty
 
@@ -173,7 +177,11 @@ Scopes:
 - Requires `SESSIONBOOT_PASSKEY`
 - Re-reads each target file at command time
 - Computes checksum from current body
-- Writes checksum line + body
+- Always refreshes the checksum; no force flag is needed
+- Replaces an existing checksum comment in place, wherever it occurs
+- If no checksum exists, inserts it immediately after the first-line shebang, or at the top when no shebang exists
+- Uses the same helper to omit checksum lines for hashing or replace them when granting; duplicate markers are removed, keeping the first marker's position
+- Preserves the shebang and existing line endings (adds a newline if a shebang-only file lacks one)
 
 ### `revoke`
 - Re-reads each target file at command time
@@ -196,9 +204,7 @@ set -o pipefail
 # commands...
 ```
 
-Notes:
-- `pipefail` is shell-dependent; this runner uses `sh -lc`.
-- On shells that do not support `pipefail`, that line will error; if needed, guard it or avoid it.
+This runner uses `bash -lc`, so `pipefail` and other Bash features are supported.
 
 ### Continue and track your own status (lenient)
 If you want to keep going and decide final success yourself, capture return codes and `exit` at the end.

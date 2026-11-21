@@ -17,6 +17,7 @@ import process from "node:process";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 const BOOT_TIMEOUT_MS = 10_000;
+const CHECKSUM_PATTERN = /^#checksum: ([A-Za-z0-9]{8})[\t ]*(?:\r?\n|$)/gm;
 
 async function existsFile(filePath) {
   try {
@@ -92,11 +93,10 @@ function makeHashkey(passkey, body) {
 
 function readRC(raw, passkey) {
   const text = String(raw ?? "");
-  const lines = text.split(/\r?\n/);
-  const first = (lines[0] ?? "").trim();
-  const checksumMatch = first.match(/^@([A-Za-z0-9]{8})$/);
-  const checksum = checksumMatch ? checksumMatch[1] : "";
-  const body = checksum ? lines.slice(1).join("\n") : text;
+  const matches = [...text.matchAll(CHECKSUM_PATTERN)];
+  const checksum = matches.length === 1 ? matches[0][1] : "";
+  // Exclude trust markers from hashing and display; execute the original file.
+  const body = serializeRC(text, "");
   const hashkey = passkey ? makeHashkey(passkey, body) : "";
   const safe = Boolean(checksum && hashkey && checksum === hashkey);
 
@@ -132,9 +132,28 @@ function parseSessionBootCommandArgs(args) {
   return { action, scope };
 }
 
-function serializeRC(body, checksum) {
+function serializeRC(raw, checksum) {
+  const text = String(raw ?? "");
+  const matches = [...text.matchAll(CHECKSUM_PATTERN)];
+  const body = text.replace(CHECKSUM_PATTERN, "");
   if (!checksum) return body;
-  return body ? `@${checksum}\n${body}` : `@${checksum}`;
+
+  const comment = `#checksum: ${checksum}`;
+  if (matches.length > 0) {
+    // Replace at the first marker's original position and remove any duplicates.
+    const first = matches[0];
+    const ending = first[0].match(/\r?\n$/)?.[0] ?? "";
+    return `${body.slice(0, first.index)}${comment}${ending}${body.slice(first.index)}`;
+  }
+
+  const newline = body.includes("\r\n") ? "\r\n" : "\n";
+  const shebang = body.match(/^#![^\r\n]*(?:\r?\n|$)/);
+  if (!shebang) return body ? `${comment}${newline}${body}` : comment;
+
+  const first = shebang[0];
+  const separator = first.endsWith("\n") ? "" : newline;
+  const rest = body.slice(first.length);
+  return `${first}${separator}${comment}${rest ? `${newline}${rest}` : ""}`;
 }
 
 function launchedWithContinueFlag(argv = process.argv) {
@@ -167,10 +186,7 @@ function launchedWithNoSessionBootFlag(argv = process.argv) {
 }
 
 async function runCommand(pi, command, signal) {
-  if (process.platform === "win32") {
-    return pi.exec("cmd", ["/d", "/s", "/c", command], { signal });
-  }
-  return pi.exec("sh", ["-lc", command], { signal });
+  return pi.exec("bash", ["-lc", command], { signal });
 }
 
 
@@ -187,8 +203,8 @@ function withFinalBlankLine(text) {
   return trimmed ? `${trimmed}\n\n` : "";
 }
 
-function formatScriptSection(body) {
-  return trimTrailingBlankLines(body);
+function formatScriptSection(raw) {
+  return serializeRC(raw, "");
 }
 
 function formatPromptSection(stdout, stderr) {
@@ -285,9 +301,9 @@ export default function sessionBootExtension(pi) {
 
         for (const config of configs) {
           const currentRaw = await readFile(config.path, "utf8");
-          const rc = readRC(currentRaw, passkey);
-          const checksum = makeHashkey(passkey, rc.body);
-          await writeFile(config.path, serializeRC(rc.body, checksum), "utf8");
+          // Inserting after a shebang-only file may introduce its missing newline.
+          const unsigned = readRC(serializeRC(currentRaw, "00000000"), passkey);
+          await writeFile(config.path, serializeRC(currentRaw, unsigned.hashkey), "utf8");
         }
 
         ctx.ui.notify(`Granted ${configs.length} rc file(s).`, "info");
@@ -296,8 +312,7 @@ export default function sessionBootExtension(pi) {
 
       for (const config of configs) {
         const currentRaw = await readFile(config.path, "utf8");
-        const rc = readRC(currentRaw, "");
-        await writeFile(config.path, serializeRC(rc.body, ""), "utf8");
+        await writeFile(config.path, serializeRC(currentRaw, ""), "utf8");
       }
 
       ctx.ui.notify(`Revoked ${configs.length} rc file(s).`, "info");
@@ -322,11 +337,10 @@ export default function sessionBootExtension(pi) {
       if (!passkey) {
         for (const config of configs) {
           const configPath = toHomeTilde(config.path);
-          const rc = readRC(config.raw, passkey);
           await postBootstrap(`⚠️ ${configPath}
 Missing SESSIONBOOT_PASSKEY. Skipped processing.
 
-${formatScriptSection(rc.body)}`);
+${formatScriptSection(config.raw)}`);
         }
         return;
       }
@@ -337,9 +351,9 @@ ${formatScriptSection(rc.body)}`);
 
         if (!rc.checksum) {
           await postBootstrap(`🔒 ${configPath}
-Missing checksum line. Expected first line format: @XXXXXXXX
+Missing or duplicate checksum line. Expected one comment anywhere: #checksum: XXXXXXXX
 
-${formatScriptSection(rc.body)}`);
+${formatScriptSection(config.raw)}`);
           continue;
         }
 
@@ -347,7 +361,7 @@ ${formatScriptSection(rc.body)}`);
           await postBootstrap(`☠️ ${configPath}
 Checksum mismatch. checksum=${rc.checksum} hashkey=${rc.hashkey}
 
-${formatScriptSection(rc.body)}`);
+${formatScriptSection(config.raw)}`);
           continue;
         }
 
@@ -362,7 +376,7 @@ ${formatScriptSection(rc.body)}`);
         let timedOut = false;
 
         try {
-          const execResult = await runCommand(pi, rc.body, timeoutController.signal);
+          const execResult = await runCommand(pi, config.raw, timeoutController.signal);
           exitCode = execResult.exitCode ?? 0;
           stdoutContent = execResult.stdout ?? "";
           stderrContent = execResult.stderr ?? "";
@@ -384,7 +398,7 @@ ${formatScriptSection(rc.body)}`);
             ? `exit code ${exitCode}`
             : "";
 
-        const scriptSection = formatScriptSection(rc.body);
+        const scriptSection = formatScriptSection(config.raw);
         const promptSection = formatPromptSection(stdoutContent, stderrContent);
 
         const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
