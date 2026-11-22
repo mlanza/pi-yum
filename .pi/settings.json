@@ -1,0 +1,14 @@
+{
+  "packages": [
+    {
+      "source": "npm:privateer-speak",
+      "autoload": false,
+      "extensions": [
+        "!**/*"
+      ]
+    }
+  ],
+  "extensions": [
+    "../huh.js"
+  ]
+}
