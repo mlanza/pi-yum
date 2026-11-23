@@ -17,6 +17,7 @@ import process from "node:process";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 const BOOT_TIMEOUT_MS = 10_000;
+const SESSIONBOOT_SAMPLES_FLAG = "sessionboot-samples";
 const CHECKSUM_PATTERN = /^#checksum: ([A-Za-z0-9]{8})[\t ]*(?:\r?\n|$)/gm;
 
 async function existsFile(filePath) {
@@ -216,23 +217,67 @@ function formatPromptSection(stdout, stderr) {
 function renderSessionBootMessage(message, options, theme) {
   const content = String(message?.content ?? "");
   const summary = firstLine(content);
-  let text = `${theme.fg("accent", "[session-boot]")} ${summary}`;
+  let text = `${theme.fg("success", "[session-boot]")} ${theme.fg("text", summary)}`;
 
   if (options.expanded) {
-    text += `\n\n${content}`;
+    text += `\n\n${theme.fg("text", content)}`;
   } else {
     text += ` ${theme.fg("dim", `(${options.keyHint("app.tools.expand", "expand")})`)}`;
   }
 
-  const bgColor = theme.colors.customMessageBg;
-  const fgColor = theme.colors.terminalFg;
-  const styled = theme.style(text, { bg: bgColor, fg: fgColor });
-
-  const box = new Box(options.outputPad, 0);
-  box.addChild(new Text(styled, 0, 0));
+  const box = new Box(options.outputPad, 0, (line) => theme.bg("toolSuccessBg", line));
+  box.addChild(new Text(text, 0, 0));
   return box;
 }
 
+
+// Optional theme samples, enabled with --sessionboot-samples.
+function registerTemporaryColorTests(pi) {
+  const palettes = [
+    { label: "customMessageLabel", text: "customMessageText", bg: "customMessageBg" },
+    { label: "accent", text: "text", bg: "userMessageBg" },
+    { label: "warning", text: "toolOutput", bg: "toolPendingBg" },
+    { label: "success", text: "text", bg: "toolSuccessBg" },
+    { label: "error", text: "muted", bg: "toolErrorBg" },
+    // Quieter combinations: use each surface's own text roles.
+    { label: "muted", text: "text" },
+    { label: "dim", text: "muted" },
+    { label: "customMessageLabel", text: "customMessageText", bg: "customMessageBg" },
+    { label: "muted", text: "userMessageText", bg: "userMessageBg" },
+    { label: "toolTitle", text: "toolOutput", bg: "toolPendingBg" },
+  ];
+
+  pi.registerEntryRenderer("session-boot-color-test", (entry, options, theme) => {
+    const { index } = entry.data;
+    const palette = palettes[index];
+    const box = new Box(options.outputPad, 0,
+      palette.bg ? (line) => theme.bg(palette.bg, line) : undefined);
+    const summary = `${palette.label} + ${palette.text} on ${palette.bg ?? "default background"}`;
+    let text = `${theme.fg(palette.label, `[color test ${index + 1}]`)} ${theme.fg(palette.text, summary)}`;
+    if (options.expanded) {
+      text += `\n\n${theme.fg(palette.text, [
+        "Sample bootstrap report",
+        "Loaded project settings and checked the working folder.",
+        "",
+        "#!/usr/bin/env bash",
+        'printf "%s\\n" "Ready for work"',
+        "",
+        "↓↓↓",
+        "",
+        "Ready for work",
+        "No warnings. No errors.",
+      ].join("\n"))}`;
+    } else {
+      text += ` ${theme.fg("dim", `(${options.keyHint("app.tools.expand", "expand")})`)}`;
+    }
+    box.addChild(new Text(text, 0, 0));
+    return box;
+  });
+
+  return () => {
+    palettes.forEach((_, index) => pi.appendEntry("session-boot-color-test", { index }));
+  };
+}
 
 /**
  * @param {import("@earendil-works/pi-coding-agent").ExtensionAPI} pi
@@ -244,18 +289,26 @@ export default function sessionBootExtension(pi) {
     default: false,
   });
 
+  pi.registerFlag(SESSIONBOOT_SAMPLES_FLAG, {
+    description: "Show session-boot theme samples above bootstrap reports",
+    type: "boolean",
+    default: false,
+  });
+
   if (launchedWithNoSessionBootFlag()) return;
 
   pi.registerMessageRenderer("session-boot-bootstrap", renderSessionBootMessage);
   // Keep reports in existing sessions readable after the rename.
   pi.registerMessageRenderer("system-prompt-bootstrap", renderSessionBootMessage);
 
+  const postTemporaryColorTests = registerTemporaryColorTests(pi);
   let bootstrapReady = Promise.resolve();
 
   async function postBootstrap(content) {
     const normalized = withFinalBlankLine(content);
     if (!normalized) return;
 
+    if (pi.getFlag(SESSIONBOOT_SAMPLES_FLAG)) postTemporaryColorTests();
     await pi.sendMessage({
       customType: "session-boot-bootstrap",
       content: normalized,

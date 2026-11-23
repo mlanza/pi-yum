@@ -10,7 +10,7 @@ import vm from "node:vm";
 import test from "node:test";
 
 const source = (await readFile(new URL("../session-boot.js", import.meta.url), "utf8"))
-  .replace(/^import .*;\n/gm, "")
+  .replace(/^import .*;\r?\n/gm, "")
   .replace("export default function", "function");
 const executeFile = promisify(execFile);
 const passkey = "test-secret";
@@ -109,9 +109,13 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
     const messages = [];
     const executions = [];
     const notices = [];
+    const entries = [];
     const pi = {
       registerFlag() {},
+      getFlag: (name) => name === "sessionboot-samples",
       registerMessageRenderer() {},
+      registerEntryRenderer() {},
+      appendEntry: (type, data) => entries.push({ type, data, messagesSoFar: messages.length }),
       registerCommand: (name, command) => commands.set(name, command),
       on: (name, handler) => events.set(name, handler),
       sendMessage: (message) => messages.push(message),
@@ -145,6 +149,9 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
 
     await events.get("session_start")({ reason: "new" }, ctx);
     assert.equal(executions.length, 1);
+    assert.equal(entries.length, 10);
+    assert.deepEqual(entries.map((entry) => entry.data.index), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.ok(entries.every((entry) => entry.messagesSoFar === 0));
     assert.equal(executions[0].command, "bash");
     assert.equal(executions[0].args[1], raw);
     assert.ok(messages[0].content.includes(`${body}\n\n↓↓↓`));
@@ -170,7 +177,10 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
     await writeFile(file, raw);
     await handler("revoke --local", ctx);
     assert.equal(await readFile(file, "utf8"), body);
+    pi.getFlag = () => false;
+    const sampleCount = entries.length;
     await events.get("session_start")({ reason: "new" }, ctx);
+    assert.equal(entries.length, sampleCount);
     assert.equal(executions.length, 1);
     assert.ok(messages.at(-1).content.includes("Missing or duplicate checksum"));
   } finally {
