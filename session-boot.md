@@ -68,6 +68,12 @@ pi --no-session-boot
 
 When this flag is present, the extension does not wire up its renderer, command, or bootstrap session hook.
 
+You can force the bootstrap message to include the script block on successful runs with:
+
+```sh
+SESSIONBOOT_SHOW_RC=1 pi
+```
+
 When bootstrap is eligible, it checks rc locations in order:
 
 1. `./.sessionbootrc` (cwd local)
@@ -98,7 +104,7 @@ Rules:
 - The checksum comment can appear anywhere in the file
 - The hash body is the whole file with that comment line (including its line ending) omitted; all other content and line endings are preserved
 - The whole original file, including the shebang and checksum, is executed with `bash -lc`
-- File text shown to Pi omits the checksum comment line but preserves the shebang and all other content
+- On safe runs, file text shown to Pi normally omits the checksum comment line but preserves the shebang and all other content
 - Bash must be available on `PATH`, including on Windows; the shebang does not select a different interpreter
 - Missing, malformed, or duplicate checksums prevent execution
 
@@ -152,8 +158,9 @@ Per-file bootstrap output is structured for scanability:
 
 - Header line: emoji + rc path
 - Optional detail line (shown on failure; includes exit code)
-- Script with the checksum comment line omitted; shebang and other original whitespace are preserved
-- `↓↓↓` separator
+- On failure: script with the checksum comment line omitted; shebang and other original whitespace are preserved
+- On success: script block is hidden unless `SESSIONBOOT_SHOW_RC=1` is set
+- `↓↓↓` separator appears only when the script block is shown
 - Command output, followed by stderr when non-empty
 
 ---

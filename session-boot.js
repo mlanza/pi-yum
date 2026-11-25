@@ -186,6 +186,10 @@ function launchedWithNoSessionBootFlag(argv = process.argv) {
   return false;
 }
 
+function launchedWithShowSessionBootRcFlag() {
+  return String(process.env.SESSIONBOOT_SHOW_RC ?? "").trim() === "1";
+}
+
 async function runCommand(pi, command, signal) {
   return pi.exec("bash", ["-lc", command], { signal });
 }
@@ -444,6 +448,7 @@ ${formatScriptSection(config.raw)}`);
         }
 
         const hasFailure = exitCode !== 0;
+        const showScriptSection = hasFailure || launchedWithShowSessionBootRcFlag();
         const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
         const detail = timedOut
           ? `exit code ${exitCode} • Timed out at ${BOOT_TIMEOUT_MS}ms`
@@ -453,16 +458,15 @@ ${formatScriptSection(config.raw)}`);
 
         const scriptSection = formatScriptSection(config.raw);
         const promptSection = formatPromptSection(stdoutContent, stderrContent);
+        const contentParts = [`${heading}${detail ? `\n${detail}` : ""}`];
 
-        const bootstrapContent = `${heading}${detail ? `\n${detail}` : ""}
+        if (showScriptSection) {
+          contentParts.push(scriptSection, "↓↓↓", promptSection);
+        } else {
+          contentParts.push(promptSection);
+        }
 
-${scriptSection}
-
-↓↓↓
-
-${promptSection}`;
-
-        await postBootstrap(bootstrapContent);
+        await postBootstrap(contentParts.join("\n\n"));
       }
     })();
 

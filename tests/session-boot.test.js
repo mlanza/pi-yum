@@ -15,11 +15,11 @@ const source = (await readFile(new URL("../session-boot.js", import.meta.url), "
 const executeFile = promisify(execFile);
 const passkey = "test-secret";
 
-function loadExtension(home = "/unused") {
+function loadExtension(home = "/unused", argv = ["node", "test"], env = {}) {
   const context = vm.createContext({
     access, readFile, writeFile, fsConstants, createHash, path,
     os: { homedir: () => home },
-    process: { env: { SESSIONBOOT_PASSKEY: passkey }, argv: ["node", "test"] },
+    process: { env: { SESSIONBOOT_PASSKEY: passkey, ...env }, argv },
     AbortController, setTimeout, clearTimeout,
   });
   vm.runInContext(source, context);
@@ -160,7 +160,8 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
     assert.ok(entries.every((entry) => entry.messagesSoFar === 0));
     assert.equal(executions[0].command, "bash");
     assert.equal(executions[0].args[1], raw);
-    assert.ok(messages[0].content.includes(`${body}\n\n↓↓↓`));
+    assert.ok(!messages[0].content.includes("↓↓↓"));
+    assert.ok(!messages[0].content.includes("#!/usr/bin/env bash"));
     assert.ok(!messages[0].content.includes("#checksum: "));
     assert.equal(await readFile(file, "utf8"), raw);
     assert.ok(messages[0].content.includes("hello bash"));
@@ -200,6 +201,43 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
     assert.equal(entries.length, sampleCount);
     assert.equal(executions.length, 1);
     assert.ok(messages.at(-1).content.includes("Missing or duplicate checksum"));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("show rc env var forces the script block on success", async function () {
+  const home = await mkdtemp(path.join(os.tmpdir(), "session-boot-test-"));
+  try {
+    const extension = loadExtension(home, ["node", "test"], { SESSIONBOOT_SHOW_RC: "1" });
+    const events = new Map();
+    const messages = [];
+    const executions = [];
+    const pi = {
+      registerFlag() {},
+      getFlag: () => false,
+      registerMessageRenderer() {},
+      registerEntryRenderer() {},
+      appendEntry() {},
+      registerCommand() {},
+      on: (name, handler) => events.set(name, handler),
+      sendMessage: (message) => messages.push(message),
+      async exec(command, args, options) {
+        executions.push({ command, args });
+        const result = await executeFile(command, args, options);
+        return { ...result, exitCode: 0 };
+      },
+    };
+    extension.sessionBootExtension(pi);
+    const ctx = { cwd: home, ui: { notify() {} } };
+    const file = path.join(home, ".sessionbootrc");
+    const raw = signed("#!/usr/bin/env bash\necho hello\n");
+    await writeFile(file, raw);
+    await events.get("session_start")({ reason: "new" }, ctx);
+    assert.equal(executions.length, 1);
+    assert.ok(messages[0].content.includes("#!/usr/bin/env bash"));
+    assert.ok(messages[0].content.includes("↓↓↓"));
+    assert.ok(messages[0].content.includes("hello"));
   } finally {
     await rm(home, { recursive: true, force: true });
   }
