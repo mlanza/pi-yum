@@ -430,7 +430,7 @@ ${formatScriptSection(config.raw)}`);
 
         try {
           const execResult = await runCommand(pi, config.raw, timeoutController.signal);
-          exitCode = execResult.exitCode ?? 0;
+          exitCode = execResult.code ?? 1;
           stdoutContent = execResult.stdout ?? "";
           stderrContent = execResult.stderr ?? "";
         } catch (err) {

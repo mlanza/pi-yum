@@ -121,8 +121,14 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
       sendMessage: (message) => messages.push(message),
       async exec(command, args, options) {
         executions.push({ command, args });
-        const result = await executeFile(command, args, options);
-        return { ...result, exitCode: 0 };
+        try {
+          const result = await executeFile(command, args, options);
+          return { ...result, code: 0, killed: false, truncated: false };
+        } catch (error) {
+          if (typeof error.code !== "number") throw error;
+          return { stdout: error.stdout, stderr: error.stderr, code: error.code,
+            killed: false, truncated: false };
+        }
       },
     };
     extension.sessionBootExtension(pi);
@@ -158,6 +164,17 @@ test("grant, bootstrap, and revoke use the full Bash file", async function () {
     assert.ok(!messages[0].content.includes("#checksum: "));
     assert.equal(await readFile(file, "utf8"), raw);
     assert.ok(messages[0].content.includes("hello bash"));
+    assert.ok(messages[0].content.startsWith("✅ "));
+
+    // pi.exec resolves nonzero exits with `code`; it does not throw.
+    const failureBody = "#!/usr/bin/env bash\nprintf 'server unavailable\\n' >&2\nexit 7\n";
+    await writeFile(file, signed(failureBody));
+    await events.get("session_start")({ reason: "new" }, ctx);
+    assert.ok(messages.at(-1).content.startsWith("❌ "));
+    assert.ok(messages.at(-1).content.includes("exit code 7"));
+    assert.ok(messages.at(-1).content.includes("↓↓↓\n\nserver unavailable"));
+    executions.pop();
+    await writeFile(file, raw);
 
     // Change an executable line, rather than the trust marker.
     await writeFile(file, raw.replace("values=(hello bash)", "values=(changed bash)"));
