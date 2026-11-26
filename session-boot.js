@@ -278,17 +278,23 @@ function buildSessionBootMessageText(message, options, theme, collapsedLines = 1
   const { summary, body } = splitSessionBootContent(content);
   const title = `${theme.fg("success", "[session-boot]")} ${theme.fg("text", summary)}`;
 
-  if (!body) return `${title}\n`;
+  if (!body) return title;
 
   const bodyLines = body.split(/\r?\n/);
-  const { displayLines, remaining } = getCollapsedSessionBootPreview(bodyLines, collapsedLines);
+  const collapsedLimit = Math.max(1, Math.floor(collapsedLines));
+  const { displayLines, remaining } = getCollapsedSessionBootPreview(bodyLines, collapsedLimit);
+
+  if (!options.expanded && collapsedLimit <= 1) {
+    const hint = options.keyHint("app.tools.expand", "expand");
+    return `${title} ${theme.fg("dim", `... (${bodyLines.length} more lines, ${hint})`)}`;
+  }
 
   if (options.expanded || remaining === 0) {
     return `${title}\n\n${theme.fg("text", body)}\n`;
   }
 
   const hint = options.keyHint("app.tools.expand", "expand");
-  const lineHint = `${theme.fg("muted", `... (${remaining} more lines,`)} ${hint}${theme.fg("muted", ")")}`;
+  const lineHint = `${theme.fg("muted", `... (${remaining} more lines, ${hint})`)}`;
   const lines = displayLines.map((line) => theme.fg("text", line));
   lines[lines.length - 1] += ` ${lineHint}`;
 

@@ -118,7 +118,15 @@ test("session-boot message text keeps the title padded and hides pointless hints
     theme,
     1,
   );
-  assert.equal(hinted, "[session-boot] ✅ ~/.sessionbootrc\n\nline one ... (2 more lines, expand)");
+  assert.equal(hinted, "[session-boot] ✅ ~/.sessionbootrc ... (3 more lines, expand)");
+
+  const clipped = helpers.buildSessionBootMessageText(
+    { content: "✅ ~/.sessionbootrc\nline one\nline two\nline three" },
+    { expanded: false, keyHint: () => "expand" },
+    theme,
+    2,
+  );
+  assert.equal(clipped, "[session-boot] ✅ ~/.sessionbootrc\n\nline one\nline two ... (1 more lines, expand)");
 
   const expanded = helpers.buildSessionBootMessageText(
     { content: "✅ ~/.sessionbootrc\nexit code 7\n#!/usr/bin/env bash\necho hello" },
