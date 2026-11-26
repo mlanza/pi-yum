@@ -242,3 +242,47 @@ test("show rc env var forces the script block on success", async function () {
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("session-boot locate posts the listing before rc files", async function () {
+  const home = await mkdtemp(path.join(os.tmpdir(), "session-boot-test-"));
+  try {
+    const extension = loadExtension(home);
+    const commands = new Map();
+    const messages = [];
+    const pi = {
+      registerFlag() {},
+      getFlag: () => false,
+      registerMessageRenderer() {},
+      registerEntryRenderer() {},
+      appendEntry() {},
+      registerCommand: (name, command) => commands.set(name, command),
+      on() {},
+      sendMessage: (message) => messages.push(message),
+      async exec(command, args, options) {
+        return executeFile(command, args, options);
+      },
+    };
+    extension.sessionBootExtension(pi);
+    const ctx = { cwd: home, ui: { notify() {} } };
+    const file = path.join(home, ".sessionbootrc");
+    await writeFile(file, signed("#!/usr/bin/env bash\necho hello\n"));
+    await commands.get("session-boot").handler("locate --local", ctx);
+    assert.equal(messages.length, 2);
+    assert.ok(messages[0].content.startsWith("🔎 Boot file detected\n"));
+    assert.ok(messages[0].content.includes("✅ ~/.sessionbootrc"));
+    assert.ok(messages[1].content.startsWith("🖼️ ~/.sessionbootrc\n"));
+    assert.ok(messages[1].content.includes("#!/usr/bin/env bash"));
+    assert.ok(messages[1].content.includes("echo hello"));
+    assert.ok(!messages[1].content.includes("↓↓↓"));
+    assert.ok(!messages[1].content.includes("#checksum:"));
+
+    messages.length = 0;
+    await rm(file);
+    await commands.get("session-boot").handler("locate --local", ctx);
+    assert.equal(messages.length, 1);
+    assert.ok(messages[0].content.startsWith("❌ No boot file detected\n"));
+    assert.ok(messages[0].content.includes("• ~/.sessionbootrc"));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});

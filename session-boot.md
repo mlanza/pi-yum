@@ -68,7 +68,7 @@ pi --no-session-boot
 
 When this flag is present, the extension does not wire up its renderer, command, or bootstrap session hook.
 
-You can force the bootstrap message to include the script block on successful runs with:
+You can force successful bootstrap messages to include the script block with:
 
 ```sh
 SESSIONBOOT_SHOW_RC=1 pi
@@ -160,7 +160,8 @@ Per-file bootstrap output is structured for scanability:
 - Optional detail line (shown on failure; includes exit code)
 - On failure: script with the checksum comment line omitted; shebang and other original whitespace are preserved
 - On success: script block is hidden unless `SESSIONBOOT_SHOW_RC=1` is set
-- `↓↓↓` separator appears only when the script block is shown
+- `/session-boot locate` posts the candidate list first, then each discovered rc file body
+- `↓↓↓` separator appears only when the script block is shown alongside output
 - Command output, followed by stderr when non-empty
 
 ---

@@ -186,8 +186,8 @@ function launchedWithNoSessionBootFlag(argv = process.argv) {
   return false;
 }
 
-function launchedWithShowSessionBootRcFlag() {
-  return String(process.env.SESSIONBOOT_SHOW_RC ?? "").trim() === "1";
+function launchedWithShowSessionBootRcFlag(value) {
+  return String(value ?? "").trim() === "1";
 }
 
 async function runCommand(pi, command, signal) {
@@ -216,6 +216,29 @@ function formatPromptSection(stdout, stderr) {
   const out = trimTrailingBlankLines(stdout);
   const err = trimTrailingBlankLines(stderr);
   return [out, err].filter(Boolean).join("\n\n");
+}
+
+function formatRcMessage({ emoji, path, detail = "", script = "", output = "", showScript = true, showOutput = false }) {
+  const heading = `${emoji} ${path}${detail ? `\n${detail}` : ""}`;
+  const contentParts = [heading];
+
+  if (showScript) contentParts.push(script);
+  if (showOutput) {
+    if (showScript) contentParts.push("↓↓↓");
+    contentParts.push(output);
+  }
+
+  return contentParts.join("\n\n");
+}
+
+function formatLocateMessage(files, hasBootFile) {
+  const header = hasBootFile ? "🔎 Boot file detected" : "❌ No boot file detected";
+  const lines = files.map((file) => {
+    const marker = file.exists ? "✅" : "•";
+    return `${marker} ${toHomeTilde(file.path)}`;
+  });
+
+  return [header, ...lines].join("\n");
 }
 
 function renderSessionBootMessage(message, options, theme) {
@@ -308,11 +331,11 @@ export default function sessionBootExtension(pi) {
   const postTemporaryColorTests = registerTemporaryColorTests(pi);
   let bootstrapReady = Promise.resolve();
 
-  async function postBootstrap(content) {
+  async function postBootstrap(content, { includeSamples = true } = {}) {
     const normalized = withFinalBlankLine(content);
     if (!normalized) return;
 
-    if (pi.getFlag(SESSIONBOOT_SAMPLES_FLAG)) postTemporaryColorTests();
+    if (includeSamples && pi.getFlag(SESSIONBOOT_SAMPLES_FLAG)) postTemporaryColorTests();
     await pi.sendMessage({
       customType: "session-boot-bootstrap",
       content: normalized,
@@ -335,12 +358,18 @@ export default function sessionBootExtension(pi) {
       const configs = configResult.configs;
 
       if (action === "locate") {
-        const lines = configResult.files.map((file) => {
-          const marker = file.exists ? "✅" : "•";
-          return `${marker} ${toHomeTilde(file.path)}`;
-        });
-        const detail = configs.length === 0 ? "\n\nNo config found." : "";
-        ctx.ui.notify(`Lookup order (${scope}):\n${lines.join("\n")}${detail}`, "info");
+        await postBootstrap(formatLocateMessage(configResult.files, configs.length > 0), { includeSamples: false });
+
+        for (const config of configs) {
+          await postBootstrap(formatRcMessage({
+            emoji: "🖼️",
+            path: toHomeTilde(config.path),
+            script: formatScriptSection(config.raw),
+            showScript: true,
+            showOutput: false,
+          }), { includeSamples: false });
+        }
+
         return;
       }
 
@@ -393,11 +422,14 @@ export default function sessionBootExtension(pi) {
       const passkey = String(process.env.SESSIONBOOT_PASSKEY ?? "").trim();
       if (!passkey) {
         for (const config of configs) {
-          const configPath = toHomeTilde(config.path);
-          await postBootstrap(`⚠️ ${configPath}
-Missing SESSIONBOOT_PASSKEY. Skipped processing.
-
-${formatScriptSection(config.raw)}`);
+          await postBootstrap(formatRcMessage({
+            emoji: "⚠️",
+            path: toHomeTilde(config.path),
+            detail: "Missing SESSIONBOOT_PASSKEY. Skipped processing.",
+            script: formatScriptSection(config.raw),
+            showScript: true,
+            showOutput: false,
+          }));
         }
         return;
       }
@@ -407,18 +439,26 @@ ${formatScriptSection(config.raw)}`);
         const rc = readRC(config.raw, passkey);
 
         if (!rc.checksum) {
-          await postBootstrap(`🔒 ${configPath}
-Missing or duplicate checksum line. Expected one comment anywhere: #checksum: XXXXXXXX
-
-${formatScriptSection(config.raw)}`);
+          await postBootstrap(formatRcMessage({
+            emoji: "🔒",
+            path: configPath,
+            detail: "Missing or duplicate checksum line. Expected one comment anywhere: #checksum: XXXXXXXX",
+            script: formatScriptSection(config.raw),
+            showScript: true,
+            showOutput: false,
+          }));
           continue;
         }
 
         if (!rc.safe) {
-          await postBootstrap(`☠️ ${configPath}
-Checksum mismatch. checksum=${rc.checksum} hashkey=${rc.hashkey}
-
-${formatScriptSection(config.raw)}`);
+          await postBootstrap(formatRcMessage({
+            emoji: "☠️",
+            path: configPath,
+            detail: `Checksum mismatch. checksum=${rc.checksum} hashkey=${rc.hashkey}`,
+            script: formatScriptSection(config.raw),
+            showScript: true,
+            showOutput: false,
+          }));
           continue;
         }
 
@@ -448,25 +488,22 @@ ${formatScriptSection(config.raw)}`);
         }
 
         const hasFailure = exitCode !== 0;
-        const showScriptSection = hasFailure || launchedWithShowSessionBootRcFlag();
-        const heading = `${hasFailure ? "❌" : "✅"} ${configPath}`;
+        const showScript = hasFailure || launchedWithShowSessionBootRcFlag(process.env.SESSIONBOOT_SHOW_RC);
         const detail = timedOut
           ? `exit code ${exitCode} • Timed out at ${BOOT_TIMEOUT_MS}ms`
           : hasFailure
             ? `exit code ${exitCode}`
             : "";
 
-        const scriptSection = formatScriptSection(config.raw);
-        const promptSection = formatPromptSection(stdoutContent, stderrContent);
-        const contentParts = [`${heading}${detail ? `\n${detail}` : ""}`];
-
-        if (showScriptSection) {
-          contentParts.push(scriptSection, "↓↓↓", promptSection);
-        } else {
-          contentParts.push(promptSection);
-        }
-
-        await postBootstrap(contentParts.join("\n\n"));
+        await postBootstrap(formatRcMessage({
+          emoji: hasFailure ? "❌" : "✅",
+          path: configPath,
+          detail,
+          script: formatScriptSection(config.raw),
+          output: formatPromptSection(stdoutContent, stderrContent),
+          showScript,
+          showOutput: true,
+        }));
       }
     })();
 
