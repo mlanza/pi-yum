@@ -74,6 +74,14 @@ You can force successful bootstrap messages to include the script block with:
 SESSIONBOOT_SHOW_RC=1 pi
 ```
 
+You can change the collapsed preview length with:
+
+```sh
+SESSIONBOOT_COLLAPSED_LINES=7 pi
+```
+
+If unset, Pi shows 10 collapsed lines from the bootstrap message before the expand hint. The preview uses the first N lines of the rc output; if more remain, the collapsed view adds an expand hint on the last shown line.
+
 When bootstrap is eligible, it checks rc locations in order:
 
 1. `./.sessionbootrc` (cwd local)

@@ -75,6 +75,22 @@ function unique(items) {
   return [...new Set(items)];
 }
 
+const SESSIONBOOT_COLLAPSED_LINES_DEFAULT = 10;
+
+function getSessionBootCollapsedLines() {
+  const raw = String(process.env.SESSIONBOOT_COLLAPSED_LINES ?? "").trim();
+  const value = Number.parseInt(raw, 10);
+  return Number.isInteger(value) && value > 0 ? value : SESSIONBOOT_COLLAPSED_LINES_DEFAULT;
+}
+
+function getCollapsedSessionBootPreview(content, limit) {
+  const lines = trimTrailingBlankLines(content).split(/\r?\n/);
+  const safeLimit = Math.max(1, Math.floor(limit));
+  const displayLines = lines.slice(0, safeLimit);
+  const remaining = Math.max(0, lines.length - displayLines.length);
+  return { displayLines, remaining };
+}
+
 function toHomeTilde(filePath) {
   const home = path.resolve(os.homedir());
   const resolved = path.resolve(filePath);
@@ -249,7 +265,15 @@ function renderSessionBootMessage(message, options, theme) {
   if (options.expanded) {
     text += `\n\n${theme.fg("text", content)}`;
   } else {
-    text += ` ${theme.fg("dim", `(${options.keyHint("app.tools.expand", "expand")})`)}`;
+    const collapsedLines = getSessionBootCollapsedLines();
+    const { displayLines, remaining } = getCollapsedSessionBootPreview(content, collapsedLines);
+    const lines = displayLines.map((line) => theme.fg("text", line));
+    const hint = remaining > 0
+      ? `${theme.fg("muted", ` ... (${remaining} more lines,`)} ${options.keyHint("app.tools.expand", "expand")}${theme.fg("muted", ")")}`
+      : theme.fg("dim", `(${options.keyHint("app.tools.expand", "expand")})`);
+
+    lines[lines.length - 1] += ` ${hint}`;
+    text += `\n${lines.join("\n")}`;
   }
 
   const box = new Box(options.outputPad, 0, (line) => theme.bg("toolSuccessBg", line));
