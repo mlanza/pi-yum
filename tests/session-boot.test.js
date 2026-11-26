@@ -100,6 +100,50 @@ test("missing, malformed, duplicate, legacy, and tampered checksums fail closed"
   assert.equal(helpers.readRC(raw, "").safe, false);
 });
 
+test("session-boot message text keeps the title padded and hides pointless hints", function () {
+  const theme = { fg: (_, value) => value };
+
+  const noHint = helpers.buildSessionBootMessageText(
+    { content: "🔎 Boot file detected\n✅ ~/.sessionbootrc\n• ~/.sessionbootrc" },
+    { expanded: false, keyHint: () => "expand" },
+    theme,
+    10,
+  );
+  assert.equal(noHint, "[session-boot] 🔎 Boot file detected\n\n✅ ~/.sessionbootrc\n• ~/.sessionbootrc\n");
+  assert.equal(noHint.match(/expand/g)?.length ?? 0, 0);
+
+  const hinted = helpers.buildSessionBootMessageText(
+    { content: "✅ ~/.sessionbootrc\nline one\nline two\nline three" },
+    { expanded: false, keyHint: () => "expand" },
+    theme,
+    1,
+  );
+  assert.equal(hinted, "[session-boot] ✅ ~/.sessionbootrc\n\nline one ... (2 more lines, expand)");
+
+  const expanded = helpers.buildSessionBootMessageText(
+    { content: "✅ ~/.sessionbootrc\nexit code 7\n#!/usr/bin/env bash\necho hello" },
+    { expanded: true, keyHint: () => "expand" },
+    theme,
+    10,
+  );
+  assert.equal(expanded, "[session-boot] ✅ ~/.sessionbootrc\n\nexit code 7\n#!/usr/bin/env bash\necho hello\n");
+});
+
+test("rc blocks are trimmed and padded one blank line at a time", function () {
+  const message = helpers.formatRcMessage({
+    emoji: "🖼️",
+    path: "~/.sessionbootrc",
+    script: "\n#!/usr/bin/env bash\n\necho hello\n\n",
+    output: "\n\nready\n\n",
+    showScript: true,
+    showOutput: true,
+  });
+
+  assert.equal(message, "🖼️ ~/.sessionbootrc\n\n#!/usr/bin/env bash\n\necho hello\n\n↓↓↓\n\nready");
+  assert.ok(!message.includes("\n\n\n"));
+  assert.ok(message.startsWith("🖼️ ~/.sessionbootrc\n\n#!/usr/bin/env bash"));
+});
+
 test("grant, bootstrap, and revoke use the full Bash file", async function () {
   const home = await mkdtemp(path.join(os.tmpdir(), "session-boot-test-"));
   try {

@@ -74,13 +74,13 @@ You can force successful bootstrap messages to include the script block with:
 SESSIONBOOT_SHOW_RC=1 pi
 ```
 
-You can change the collapsed preview length with:
+You can change the collapsed preview length for the initial startup bootstrap messages with:
 
 ```sh
 SESSIONBOOT_COLLAPSED_LINES=7 pi
 ```
 
-If unset, Pi shows 10 collapsed lines from the bootstrap message before the expand hint. The preview uses the first N lines of the rc output; if more remain, the collapsed view adds an expand hint on the last shown line.
+If unset, Pi shows 10 collapsed lines from the initial bootstrap message before the expand hint. This env var also applies to `/session-boot locate` and other command-posted session-boot messages, so the same collapse rule is used everywhere. The preview uses the first N lines of the rc output; if more remain, the collapsed view adds an expand hint on the last shown line.
 
 When bootstrap is eligible, it checks rc locations in order:
 

@@ -83,8 +83,7 @@ function getSessionBootCollapsedLines() {
   return Number.isInteger(value) && value > 0 ? value : SESSIONBOOT_COLLAPSED_LINES_DEFAULT;
 }
 
-function getCollapsedSessionBootPreview(content, limit) {
-  const lines = trimTrailingBlankLines(content).split(/\r?\n/);
+function getCollapsedSessionBootPreview(lines, limit) {
   const safeLimit = Math.max(1, Math.floor(limit));
   const displayLines = lines.slice(0, safeLimit);
   const remaining = Math.max(0, lines.length - displayLines.length);
@@ -215,12 +214,22 @@ function firstLine(text) {
   return String(text || "").split(/\r?\n/, 1)[0] || "session boot";
 }
 
+function trimOuterBlankLines(text) {
+  return String(text ?? "")
+    .replace(/^(?:[\t ]*\r?\n)+/u, "")
+    .replace(/(?:\r?\n[\t ]*)+$/u, "");
+}
+
+function trimBlankLines(text) {
+  return trimOuterBlankLines(text);
+}
+
 function trimTrailingBlankLines(text) {
-  return String(text ?? "").replace(/(?:\r?\n[\t ]*)+$/u, "");
+  return trimOuterBlankLines(text);
 }
 
 function withFinalBlankLine(text) {
-  const trimmed = trimTrailingBlankLines(text);
+  const trimmed = trimOuterBlankLines(text);
   return trimmed ? `${trimmed}\n\n` : "";
 }
 
@@ -229,8 +238,8 @@ function formatScriptSection(raw) {
 }
 
 function formatPromptSection(stdout, stderr) {
-  const out = trimTrailingBlankLines(stdout);
-  const err = trimTrailingBlankLines(stderr);
+  const out = trimOuterBlankLines(stdout);
+  const err = trimOuterBlankLines(stderr);
   return [out, err].filter(Boolean).join("\n\n");
 }
 
@@ -238,10 +247,10 @@ function formatRcMessage({ emoji, path, detail = "", script = "", output = "", s
   const heading = `${emoji} ${path}${detail ? `\n${detail}` : ""}`;
   const contentParts = [heading];
 
-  if (showScript) contentParts.push(script);
+  if (showScript) contentParts.push(trimOuterBlankLines(script));
   if (showOutput) {
     if (showScript) contentParts.push("↓↓↓");
-    contentParts.push(output);
+    contentParts.push(trimOuterBlankLines(output));
   }
 
   return contentParts.join("\n\n");
@@ -257,25 +266,37 @@ function formatLocateMessage(files, hasBootFile) {
   return [header, ...lines].join("\n");
 }
 
-function renderSessionBootMessage(message, options, theme) {
+function splitSessionBootContent(content) {
+  const lines = trimOuterBlankLines(content).split(/\r?\n/);
+  const summary = lines.shift() ?? "";
+  const body = trimOuterBlankLines(lines.join("\n"));
+  return { summary, body };
+}
+
+function buildSessionBootMessageText(message, options, theme, collapsedLines = 1) {
   const content = String(message?.content ?? "");
-  const summary = firstLine(content);
-  let text = `${theme.fg("success", "[session-boot]")} ${theme.fg("text", summary)}`;
+  const { summary, body } = splitSessionBootContent(content);
+  const title = `${theme.fg("success", "[session-boot]")} ${theme.fg("text", summary)}`;
 
-  if (options.expanded) {
-    text += `\n\n${theme.fg("text", content)}`;
-  } else {
-    const collapsedLines = getSessionBootCollapsedLines();
-    const { displayLines, remaining } = getCollapsedSessionBootPreview(content, collapsedLines);
-    const lines = displayLines.map((line) => theme.fg("text", line));
-    const hint = remaining > 0
-      ? `${theme.fg("muted", ` ... (${remaining} more lines,`)} ${options.keyHint("app.tools.expand", "expand")}${theme.fg("muted", ")")}`
-      : theme.fg("dim", `(${options.keyHint("app.tools.expand", "expand")})`);
+  if (!body) return `${title}\n`;
 
-    lines[lines.length - 1] += ` ${hint}`;
-    text += `\n${lines.join("\n")}`;
+  const bodyLines = body.split(/\r?\n/);
+  const { displayLines, remaining } = getCollapsedSessionBootPreview(bodyLines, collapsedLines);
+
+  if (options.expanded || remaining === 0) {
+    return `${title}\n\n${theme.fg("text", body)}\n`;
   }
 
+  const hint = options.keyHint("app.tools.expand", "expand");
+  const lineHint = `${theme.fg("muted", `... (${remaining} more lines,`)} ${hint}${theme.fg("muted", ")")}`;
+  const lines = displayLines.map((line) => theme.fg("text", line));
+  lines[lines.length - 1] += ` ${lineHint}`;
+
+  return `${title}\n\n${lines.join("\n")}`;
+}
+
+function renderSessionBootMessage(message, options, theme, collapsedLines = 1) {
+  const text = buildSessionBootMessageText(message, options, theme, collapsedLines);
   const box = new Box(options.outputPad, 0, (line) => theme.bg("toolSuccessBg", line));
   box.addChild(new Text(text, 0, 0));
   return box;
@@ -348,20 +369,22 @@ export default function sessionBootExtension(pi) {
 
   if (launchedWithNoSessionBootFlag()) return;
 
-  pi.registerMessageRenderer("session-boot-bootstrap", renderSessionBootMessage);
+  const bootstrapCollapsedLines = getSessionBootCollapsedLines();
+  pi.registerMessageRenderer("session-boot-bootstrap", (message, options, theme) => renderSessionBootMessage(message, options, theme, bootstrapCollapsedLines));
   // Keep reports in existing sessions readable after the rename.
-  pi.registerMessageRenderer("system-prompt-bootstrap", renderSessionBootMessage);
+  pi.registerMessageRenderer("system-prompt-bootstrap", (message, options, theme) => renderSessionBootMessage(message, options, theme, bootstrapCollapsedLines));
+  pi.registerMessageRenderer("session-boot-command", (message, options, theme) => renderSessionBootMessage(message, options, theme, bootstrapCollapsedLines));
 
   const postTemporaryColorTests = registerTemporaryColorTests(pi);
   let bootstrapReady = Promise.resolve();
 
-  async function postBootstrap(content, { includeSamples = true } = {}) {
+  async function postBootstrap(content, { includeSamples = true, customType = "session-boot-command" } = {}) {
     const normalized = withFinalBlankLine(content);
     if (!normalized) return;
 
     if (includeSamples && pi.getFlag(SESSIONBOOT_SAMPLES_FLAG)) postTemporaryColorTests();
     await pi.sendMessage({
-      customType: "session-boot-bootstrap",
+      customType,
       content: normalized,
       display: true,
     });
@@ -453,7 +476,7 @@ export default function sessionBootExtension(pi) {
             script: formatScriptSection(config.raw),
             showScript: true,
             showOutput: false,
-          }));
+          }), { customType: "session-boot-bootstrap" });
         }
         return;
       }
@@ -470,7 +493,7 @@ export default function sessionBootExtension(pi) {
             script: formatScriptSection(config.raw),
             showScript: true,
             showOutput: false,
-          }));
+          }), { customType: "session-boot-bootstrap" });
           continue;
         }
 
@@ -482,7 +505,7 @@ export default function sessionBootExtension(pi) {
             script: formatScriptSection(config.raw),
             showScript: true,
             showOutput: false,
-          }));
+          }), { customType: "session-boot-bootstrap" });
           continue;
         }
 
@@ -527,7 +550,7 @@ export default function sessionBootExtension(pi) {
           output: formatPromptSection(stdoutContent, stderrContent),
           showScript,
           showOutput: true,
-        }));
+        }), { customType: "session-boot-bootstrap" });
       }
     })();
 
